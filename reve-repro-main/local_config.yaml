@@ -1,0 +1,42 @@
+# @package _global_
+defaults:
+  - config_dt
+  - override task: physio
+  - _self_
+
+data_root: /Brain/private/DT_Reve_tmp
+
+# Override the dataset paths for local machine
+task:
+  linear_probing:
+    n_epochs: 20
+    optimizer:
+      _target_: utils.stable_adamw.StableAdamW
+      lr: 1e-4
+      weight_decay: 1e-2
+    batch_size: 32
+  
+  fine_tuning:
+    n_epochs: 50
+    optimizer:
+      _target_: utils.stable_adamw.StableAdamW
+      lr: 1e-4
+      weight_decay: 1e-2
+    batch_size: 32
+
+  patience: 5
+  warmup_epochs: 0
+  n_epochs: 20
+  mixup: false
+  classifier:
+    dropout: 0.1
+    pooling: "no"
+
+pretrained_path: /Brain/private/y17eloua/yass_models/warmup/base_toxic2_228_18_512_longer_model_10.pth
+
+lora:
+  enabled: false
+
+n_runs: 1
+training_mode: lp+ft
+torch_dtype: fp16

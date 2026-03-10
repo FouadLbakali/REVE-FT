@@ -1,0 +1,7 @@
+torch==2.5.0
+accelerate==1.2.1
+einops==0.8.0
+pandas==1.5.3
+wandb==0.17.6
+numpy==1.26.4
+scipy==1.14.0

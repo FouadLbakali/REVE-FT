@@ -1,0 +1,15 @@
+Inclure le two stage fine tuning
+hyper params search lora, full fine tuning, linear
+Visual Prompt Tuning
+
+Dataset non inclus dans le pretraining :
+    PhysioNet-MI
+    BCIC-IV-2a
+    TUEV
+    TUAB
+    HMC
+    ISRUC
+    FACED
+    Mumtaz
+    MAT
+    BCI2020-IV-3
