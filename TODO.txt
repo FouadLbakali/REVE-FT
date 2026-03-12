@@ -1,4 +1,7 @@
-Inclure le two stage fine tuning
+Mouad : Inclure le two stage fine tuning
+Ayman : Lora spécifique
+Fouad : Token Sujet (ou lora generique, 2 lora, split efficace)
+
 hyper params search lora, full fine tuning, linear
 Visual Prompt Tuning
 
