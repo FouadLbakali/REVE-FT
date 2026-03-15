@@ -1,9 +1,10 @@
-Mouad : Inclure le two stage fine tuning
-Ayman : Lora spécifique
-Fouad : Token Sujet (ou lora generique, 2 lora, split efficace)
+Faire le rapport
+ajouter plus dataset
+Observer le compute apporté en utilisant lora
+Etudier le few shot
+Etudier le rang LoRA vs le nombre de sujet
 
-hyper params search lora, full fine tuning, linear
-Visual Prompt Tuning
+Explorer la piste sur le mecanisme du CLS token
 
 Dataset non inclus dans le pretraining :
     PhysioNet-MI
