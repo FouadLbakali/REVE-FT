@@ -12,13 +12,14 @@ BCI_CHANNELS = ["Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
 
 
 class BCIDataset(Dataset):
-    def __init__(self, X, y):
+    def __init__(self, X, y, subject_ids):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.long)
+        self.subject_ids = torch.tensor(subject_ids, dtype=torch.long)
     def __len__(self):
         return len(self.y)
     def __getitem__(self, idx):
-        return {"data": self.X[idx], "labels": self.y[idx]}
+        return {"data": self.X[idx], "labels": self.y[idx], "subject_id": self.subject_ids[idx]}
 
 def butter_bandpass(lowcut, highcut, fs, order=5):
     nyq = 0.5 * fs
@@ -29,8 +30,9 @@ def butter_bandpass(lowcut, highcut, fs, order=5):
 def collate(batch, positions):
     x_data = torch.stack([x["data"] for x in batch])
     y_label = torch.tensor([x["labels"] for x in batch])
+    subject_ids = torch.tensor([x["subject_id"] for x in batch])
     positions = positions.repeat(len(batch), 1, 1)
-    return {"sample": x_data,"label": y_label.long(),"pos": positions}
+    return {"sample": x_data, "label": y_label.long(), "pos": positions, "subject_id": subject_ids}
 
 def load_bciciv2a(pos_bank, batch_size, seed=None):
     positions = pos_bank(BCI_CHANNELS)
@@ -44,11 +46,13 @@ def load_bciciv2a(pos_bank, batch_size, seed=None):
     label_map = {"left_hand": 0, "right_hand": 1, "feet": 2, "tongue": 3}
     y = np.array([label_map[label] for label in y])
 
+    subjects = metadata["subject"].values.astype(int)
+
     n = len(y)
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset = BCIDataset(X, y)
+    full_dataset = BCIDataset(X, y, subjects)
     train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test])
 
     collate_fn = partial(collate, positions=positions)
