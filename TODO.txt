@@ -5,6 +5,7 @@ Etudier le few shot
 Etudier le rang LoRA vs le nombre de sujet
 
 Explorer la piste sur le mecanisme du CLS token
+- tester les ablations présentes dans le paper VPT
 
 Dataset non inclus dans le pretraining :
     PhysioNet-MI

@@ -3,11 +3,12 @@ from tqdm.auto import tqdm
 from sklearn.metrics import balanced_accuracy_score, cohen_kappa_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.preprocessing import label_binarize
 
-def train_one_epoch(model, optimizer, loader, device):
+def train_one_epoch(model, optimizer, loader, device, use_subject_id=False):
     criterion = torch.nn.CrossEntropyLoss()
     model.train()
     pbar = tqdm(loader, desc="Training", total=len(loader))
 
+    total_loss, count = 0.0, 0
     for batch_data in pbar:
         data, target, pos = (
             batch_data["sample"].to(device, non_blocking=True),
@@ -16,13 +17,21 @@ def train_one_epoch(model, optimizer, loader, device):
         )
         optimizer.zero_grad()
         with torch.amp.autocast(dtype=torch.float16, device_type="cuda" if torch.cuda.is_available() else "cpu"):
-            output = model(data, pos)
+            if use_subject_id:
+                subject_id = batch_data["subject_id"].to(device, non_blocking=True)
+                output = model(data, pos, subject_id)
+            else:
+                output = model(data, pos)
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
+        total_loss += loss.item() * target.size(0)
+        count += target.size(0)
         pbar.set_postfix({"loss": loss.item()})
 
-def eval_model(model, loader, device, n_classes=4):
+    return total_loss / count
+
+def eval_model(model, loader, device, n_classes=4, use_subject_id=False):
     model.eval()
 
     y_decisions = []
@@ -40,7 +49,11 @@ def eval_model(model, loader, device, n_classes=4):
             with torch.amp.autocast(
                 dtype=torch.float16, device_type="cuda" if torch.cuda.is_available() else "cpu"
             ):
-                output = model(data, pos)
+                if use_subject_id:
+                    subject_id = batch_data["subject_id"].to(device, non_blocking=True)
+                    output = model(data, pos, subject_id)
+                else:
+                    output = model(data, pos)
 
             decisions = torch.argmax(output, dim=1)
             score += (decisions == target).int().sum().item()
