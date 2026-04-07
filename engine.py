@@ -8,7 +8,7 @@ def train_one_epoch(model, optimizer, loader, device, use_subject_id=False):
     model.train()
     pbar = tqdm(loader, desc="Training", total=len(loader))
 
-    total_loss, count = 0.0, 0
+    total_loss, correct, count = 0.0, 0, 0
     for batch_data in pbar:
         data, target, pos = (
             batch_data["sample"].to(device, non_blocking=True),
@@ -26,10 +26,11 @@ def train_one_epoch(model, optimizer, loader, device, use_subject_id=False):
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * target.size(0)
+        correct += (output.argmax(dim=1) == target).sum().item()
         count += target.size(0)
         pbar.set_postfix({"loss": loss.item()})
 
-    return total_loss / count
+    return total_loss / count, correct / count
 
 def eval_model(model, loader, device, n_classes=4, use_subject_id=False):
     model.eval()
