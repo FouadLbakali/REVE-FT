@@ -1,0 +1,5 @@
+11 avril:
+j'ai essayé de réduire l'overfitting avec linear probing -> echec
+
+12 avril:
+construire la pipeline complete LP -> LoRA

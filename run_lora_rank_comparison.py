@@ -70,10 +70,11 @@ def run_two_stage(model, pos_bank, device, lora_rank):
         scheduler_ft = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_ft, mode="max", factor=0.5, patience=3)
 
         for epoch in range(EPOCHS_FT):
-            train_loss = train_one_epoch(lora_model, optimizer_ft, subj_train, device)
+            train_loss, train_acc = train_one_epoch(lora_model, optimizer_ft, subj_train, device)
             m = eval_model(lora_model, subj_val, device)
             stage2_losses_per_epoch[epoch].append(train_loss)
             scheduler_ft.step(m["balanced_acc"])
+            print(f"    epoch {epoch+1:2d}/{EPOCHS_FT} — loss={train_loss:.4f} — train_acc={train_acc:.4f} — val_acc={m['acc']:.4f} — val_bal_acc={m['balanced_acc']:.4f}")
 
         model = lora_model.merge_and_unload()
 

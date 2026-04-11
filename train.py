@@ -4,7 +4,7 @@ from transformers import AutoModel
 import torch
 from transformers import set_seed
 from data import load_bciciv2a, load_bciciv2a_per_subject
-from engine import train_one_epoch, eval_model
+from engine import train_one_epoch, eval_model, extract_features, train_head_one_epoch, eval_head
 import sys, types
 sys.path.insert(0, "reve-repro-main/src")
 from models.lora import get_lora_config, CustomGetLora
@@ -15,7 +15,8 @@ def main():
     parser = argparse.ArgumentParser(description='REVE Training')
     parser.add_argument('--mode', default="linear", choices=["linear", "full", "lora", "two_stage"])
     parser.add_argument('--epochs', default=15, type=int, help='number of epoch')
-    parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
+    parser.add_argument('--lr', default=0.01, type=float, help='learning rate')
+    parser.add_argument('--l1', default=1e-4, type=float, help='L1 regularization strength (0 disables)')
     parser.add_argument('--batch-size', default=64, type=int, help='batch size')
     parser.add_argument('--seed', default=None, type=int, help='seed')
     parser.add_argument('--save-final-layer', default=None, type=str, help='path to save the best final layer (linear mode)')
@@ -35,8 +36,8 @@ def main():
     model.final_layer = torch.nn.Sequential(
         torch.nn.Flatten(),
         torch.nn.RMSNorm(dim),
-        torch.nn.Dropout(0.1),
-        torch.nn.Linear(dim, 4),
+        torch.nn.Dropout(0.5),
+        torch.nn.Linear(dim, 4, bias=False),
     )
 
     if args.load_final_layer:
@@ -64,9 +65,12 @@ def run_single_stage(model, pos_bank, args, device):
     train_loader, val_loader, test_loader = load_bciciv2a(pos_bank, args.batch_size, seed=args.seed)
 
     mode = args.mode
+
     if mode == "linear":
-        params = list(model.final_layer.parameters())
-    elif mode == "full":
+        run_linear_probing_cached(model, train_loader, val_loader, test_loader, args, device)
+        return
+
+    if mode == "full":
         params = list(model.parameters())
     elif mode == "lora":
         lora_config = get_lora_config(types.SimpleNamespace(encoder=model), rank=8, apply_to=("patch", "mlp4d", "attention", "ffw"))
@@ -77,7 +81,7 @@ def run_single_stage(model, pos_bank, args, device):
     total = sum(p.numel() for p in params)
     print(f"Total paramètres : {total:,}")
 
-    optimizer = torch.optim.AdamW(params, lr=args.lr)
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.1)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
     model.to(device)
 
@@ -86,7 +90,7 @@ def run_single_stage(model, pos_bank, args, device):
 
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
-        train_loss, train_acc = train_one_epoch(model, optimizer, train_loader, device)
+        train_loss, train_acc = train_one_epoch(model, optimizer, train_loader, device, l1_lambda=args.l1)
         b_acc = eval_model(model, val_loader, device)["balanced_acc"]
         if b_acc > best_val_acc:
             best_val_acc = b_acc
@@ -96,11 +100,59 @@ def run_single_stage(model, pos_bank, args, device):
 
     model.final_layer.load_state_dict(best_final_layer)
 
-    if args.mode == "linear" and args.save_final_layer:
+    results = eval_model(model, test_loader, device)
+
+    # Results
+    print("acc", results["acc"])
+    print("balanced_acc", results["balanced_acc"])
+    print("cohen_kappa", results["cohen_kappa"])
+    print("f1", results["f1"])
+    print("auroc", results["auroc"])
+    print("auc_pr", results["auc_pr"])
+
+
+def run_linear_probing_cached(model, train_loader, val_loader, test_loader, args, device):
+    """Linear probing with feature caching: backbone forward is done once per split
+    instead of every epoch, so only the classification head is trained."""
+    model.to(device)
+
+    # One-shot feature extraction (backbone is frozen)
+    print("Extracting cached features (one-shot backbone forward)...")
+    train_features, train_labels = extract_features(model, train_loader, device)
+    val_features, val_labels = extract_features(model, val_loader, device)
+    test_features, test_labels = extract_features(model, test_loader, device)
+    print(f"  Train: {tuple(train_features.shape)} | Val: {tuple(val_features.shape)} | Test: {tuple(test_features.shape)}")
+
+    head = model.final_layer
+    params = list(head.parameters())
+    total = sum(p.numel() for p in params)
+    print(f"Total paramètres : {total:,}")
+
+    optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.1)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+
+    best_val_acc = 0
+    best_final_layer = None
+
+    for epoch in range(args.epochs):
+        print(f"Epoch {epoch + 1}/{args.epochs}")
+        train_loss, train_acc = train_head_one_epoch(
+            head, optimizer, train_features, train_labels, args.batch_size, device, l1_lambda=args.l1
+        )
+        b_acc = eval_head(head, val_features, val_labels, device)["balanced_acc"]
+        if b_acc > best_val_acc:
+            best_val_acc = b_acc
+            best_final_layer = copy.deepcopy(head.state_dict())
+        print(f"Train acc: {train_acc:.4f} | Validation balanced accuracy: {b_acc:.4f}, best: {best_val_acc:.4f}")
+        scheduler.step(b_acc)
+
+    head.load_state_dict(best_final_layer)
+
+    if args.save_final_layer:
         torch.save(best_final_layer, args.save_final_layer)
         print(f"Final layer saved to {args.save_final_layer}")
 
-    results = eval_model(model, test_loader, device)
+    results = eval_head(head, test_features, test_labels, device)
 
     # Results
     print("acc", results["acc"])
@@ -147,7 +199,7 @@ def run_two_stage(model, pos_bank, args, device):
 
         for epoch in range(args.epochs):
             print(f"\n[LP] Epoch {epoch + 1}/{args.epochs}")
-            train_loss, train_acc = train_one_epoch(model, optimizer_lp, pooled_train, device)
+            train_loss, train_acc = train_one_epoch(model, optimizer_lp, pooled_train, device, l1_lambda=args.l1)
             b_acc = eval_model(model, pooled_val, device)["balanced_acc"]
             if b_acc > best_val_acc:
                 best_val_acc = b_acc
@@ -197,7 +249,7 @@ def run_two_stage(model, pos_bank, args, device):
 
         for epoch in range(args.ft_epochs):
             print(f"\n  [FT-S{subj}] Epoch {epoch + 1}/{args.ft_epochs}")
-            train_loss, train_acc = train_one_epoch(lora_model, optimizer_ft, subj_train, device)
+            train_loss, train_acc = train_one_epoch(lora_model, optimizer_ft, subj_train, device, l1_lambda=args.l1)
             m = eval_model(lora_model, subj_val, device)
             b_acc = m["balanced_acc"]
             if b_acc > best_val:
