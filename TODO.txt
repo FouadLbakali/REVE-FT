@@ -15,3 +15,4 @@ Dataset non inclus dans le pretraining :
     Mumtaz
     MAT
     BCI2020-IV-3
+

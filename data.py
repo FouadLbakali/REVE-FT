@@ -1,14 +1,20 @@
+import socket
+import time
 from functools import partial
-from moabb.datasets import BNCI2014_001
+from moabb.datasets import BNCI2014_001, PhysionetMI, Zuo2025
 from moabb.paradigms import MotorImagery
 from scipy.signal import butter, lfilter
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, random_split
 
 BCI_CHANNELS = ["Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
                  "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
                  "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz", "P2", "POz"]
+
+PHYSIONET_RESAMPLE = 200
+PHYSIONET_PATCH_SIZE = 200
 
 
 class BCIDataset(Dataset):
@@ -127,3 +133,234 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None):
         )
 
     return pooled_loaders, subject_loaders
+
+
+def _load_physionet_data(num_subjects):
+    subjects_list = list(range(1, num_subjects + 1))
+
+    prev_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(300)
+
+    paradigm = MotorImagery(
+        n_classes=4, resample=PHYSIONET_RESAMPLE, fmin=8, fmax=30, channels=BCI_CHANNELS
+    )
+    mi_dataset = PhysionetMI()
+
+    all_X, all_y, all_meta = [], [], []
+    for subj in subjects_list:
+        for attempt in range(3):
+            try:
+                Xi, yi, mi = paradigm.get_data(dataset=mi_dataset, subjects=[subj])
+                all_X.append(Xi)
+                all_y.append(yi)
+                all_meta.append(mi)
+                print(f"  Subject {subj}: {len(yi)} trials")
+                break
+            except Exception as e:
+                print(f"  Subject {subj} attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(5)
+                else:
+                    raise
+
+    min_len = min(Xi.shape[-1] for Xi in all_X)
+    all_X = [Xi[:, :, :min_len] for Xi in all_X]
+    X = np.concatenate(all_X, axis=0)
+    y_raw = np.concatenate(all_y, axis=0)
+    metadata = pd.concat(all_meta, ignore_index=True)
+
+    socket.setdefaulttimeout(prev_timeout)
+
+    # Truncate to clean multiple of PATCH_SIZE (PhysioNet trials are 601 samples @ 200 Hz)
+    n_samples = X.shape[-1]
+    usable = (n_samples // PHYSIONET_PATCH_SIZE) * PHYSIONET_PATCH_SIZE
+    X = X[:, :, :usable]
+
+    b, a = butter_bandpass(8, 30, PHYSIONET_RESAMPLE)
+    X = lfilter(b, a, X, axis=-1)
+
+    # PhysioNet's 4-class paradigm returns "rest" trials we must drop
+    label_map = {"left_hand": 0, "right_hand": 1, "feet": 2, "hands": 3}
+    keep = np.array([str(label) in label_map for label in y_raw])
+    X = X[keep]
+    y_raw = y_raw[keep]
+    metadata = metadata[keep].reset_index(drop=True)
+    y = np.array([label_map[str(label)] for label in y_raw])
+
+    return X, y, metadata
+
+
+def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10):
+    positions = pos_bank(BCI_CHANNELS)
+    X, y, metadata = _load_physionet_data(num_subjects)
+    subject_ids = metadata["subject"].values.astype(int) - 1
+
+    n = len(y)
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+    n_test = n - n_train - n_val
+    full_dataset = BCIDataset(X, y, subject_ids)
+
+    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
+    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+
+    collate_fn = partial(collate, positions=positions)
+
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+    return (train_loader, val_loader, test_loader)
+
+
+def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=10):
+    positions = pos_bank(BCI_CHANNELS)
+    X, y, metadata = _load_physionet_data(num_subjects)
+    subjects_raw = metadata["subject"].values.astype(int)
+    subject_ids = subjects_raw - 1
+
+    collate_fn = partial(collate, positions=positions)
+
+    n = len(y)
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+    n_test = n - n_train - n_val
+    full_dataset = BCIDataset(X, y, subject_ids)
+
+    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
+    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+
+    pooled_loaders = (
+        torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
+        torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+        torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+    )
+
+    unique_subjects = sorted(np.unique(subjects_raw))
+    subject_loaders = {}
+    for subj in unique_subjects:
+        mask = (subjects_raw == subj)
+        subj_X, subj_y = X[mask], y[mask]
+        subj_ids = subject_ids[mask]
+        subj_dataset = BCIDataset(subj_X, subj_y, subj_ids)
+
+        sn = len(subj_y)
+        sn_train = int(0.7 * sn)
+        sn_val = int(0.15 * sn)
+        sn_test = sn - sn_train - sn_val
+
+        gen_s = torch.Generator().manual_seed(seed) if seed else torch.Generator()
+        s_train, s_val, s_test = random_split(subj_dataset, [sn_train, sn_val, sn_test], generator=gen_s)
+
+        subject_loaders[int(subj)] = (
+            torch.utils.data.DataLoader(s_train, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
+            torch.utils.data.DataLoader(s_val, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+            torch.utils.data.DataLoader(s_test, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+        )
+
+
+def _load_zuo2025_data():
+    paradigm = MotorImagery(n_classes=2, resample=250, fmin=8, fmax=30)
+    dataset = Zuo2025()
+    epochs, y_raw, metadata = paradigm.get_data(dataset=dataset, return_epochs=True)
+    ch_names = epochs.ch_names
+    X = epochs.get_data()
+
+    b, a = butter_bandpass(8, 30, 250)
+    X = lfilter(b, a, X, axis=-1)
+
+    label_map = {"left_hand": 0, "right_hand": 1}
+    keep = np.array([str(label) in label_map for label in y_raw])
+    X = X[keep]
+    y_raw = y_raw[keep]
+    metadata = metadata[keep].reset_index(drop=True)
+    y = np.array([label_map[str(label)] for label in y_raw])
+
+    return X, y, metadata, ch_names
+
+
+def load_zuo2025(pos_bank, batch_size, seed=None):
+    X, y, metadata, ch_names = _load_zuo2025_data()
+    positions = pos_bank(ch_names)
+    subject_ids = metadata["subject"].values.astype(int) - 1
+
+    n = len(y)
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+    n_test = n - n_train - n_val
+    full_dataset = BCIDataset(X, y, subject_ids)
+
+    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
+    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+
+    collate_fn = partial(collate, positions=positions)
+
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+
+    return (train_loader, val_loader, test_loader)
+
+
+def load_zuo2025_per_subject(pos_bank, batch_size, seed=None):
+    X, y, metadata, ch_names = _load_zuo2025_data()
+    positions = pos_bank(ch_names)
+    subjects_raw = metadata["subject"].values.astype(int)
+    subject_ids = subjects_raw - 1
+
+    collate_fn = partial(collate, positions=positions)
+
+    n = len(y)
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+    n_test = n - n_train - n_val
+    full_dataset = BCIDataset(X, y, subject_ids)
+
+    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
+    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+
+    pooled_loaders = (
+        torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
+        torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+        torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+    )
+
+    unique_subjects = sorted(np.unique(subjects_raw))
+    subject_loaders = {}
+    for subj in unique_subjects:
+        mask = (subjects_raw == subj)
+        subj_X, subj_y = X[mask], y[mask]
+        subj_ids = subject_ids[mask]
+        subj_dataset = BCIDataset(subj_X, subj_y, subj_ids)
+
+        sn = len(subj_y)
+        sn_train = int(0.7 * sn)
+        sn_val = int(0.15 * sn)
+        sn_test = sn - sn_train - sn_val
+
+        gen_s = torch.Generator().manual_seed(seed) if seed else torch.Generator()
+        s_train, s_val, s_test = random_split(subj_dataset, [sn_train, sn_val, sn_test], generator=gen_s)
+
+        subject_loaders[int(subj)] = (
+            torch.utils.data.DataLoader(s_train, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
+            torch.utils.data.DataLoader(s_val, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+            torch.utils.data.DataLoader(s_test, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+        )
+
+    return pooled_loaders, subject_loaders
+
+
+def load_loaders(dataset, pos_bank, batch_size, seed=None, num_subjects=109):
+    if dataset == "physionet":
+        return load_physionet_mi(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
+    if dataset == "zuo2025":
+        return load_zuo2025(pos_bank, batch_size, seed=seed)
+    return load_bciciv2a(pos_bank, batch_size, seed=seed)
+
+
+def load_loaders_per_subject(dataset, pos_bank, batch_size, seed=None, num_subjects=109):
+    if dataset == "physionet":
+        return load_physionet_mi_per_subject(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
+    if dataset == "zuo2025":
+        return load_zuo2025_per_subject(pos_bank, batch_size, seed=seed)
+    return load_bciciv2a_per_subject(pos_bank, batch_size, seed=seed)

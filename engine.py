@@ -12,7 +12,7 @@ def _compute_metrics(y_targets, y_decisions, y_probs, n_classes=4):
     balanced_acc = balanced_accuracy_score(gt, pr)
     cohen_kappa = cohen_kappa_score(gt, pr)
     f1 = f1_score(gt, pr, average="weighted")
-    auroc = roc_auc_score(gt, pr_probs, multi_class='ovr')
+    auroc = roc_auc_score(gt, pr_probs, multi_class='ovr', labels=list(range(n_classes)))
     auc_pr = average_precision_score(label_binarize(gt, classes=range(n_classes)), pr_probs, average='macro')
     return {"acc": acc, "balanced_acc": balanced_acc, "cohen_kappa": cohen_kappa,
             "f1": f1, "auroc": auroc, "auc_pr": auc_pr}

@@ -1,4 +1,7 @@
 __pycache__
 .claude
 logs
+sweep_logs
 *.pt
+CLAUDE.md
+*.sh
