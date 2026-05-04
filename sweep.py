@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from itertools import product
 from statistics import mean, stdev
 
@@ -17,13 +18,21 @@ VAL_RE = re.compile(r"best:\s*([0-9.]+)")
 TEST_RE = re.compile(r"^\s*balanced_acc:\s*([0-9.]+)", re.MULTILINE)
 
 
-def run_one(base_cmd, param, value, sched, seed, log_path):
+def run_one(base_cmd, param, value, sched, seed):
     cmd = base_cmd + ["--seed", str(seed), param, str(value), "--scheduler", sched]
     print(f"\n>>> {' '.join(cmd)}")
-    with open(log_path, "w") as f:
+    for attempt in range(3):
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        f.write(proc.stdout)
+        # Retry on transient NFS EACCES when the interpreter can't open the script
+        if proc.returncode == 2 and "Permission denied" in (proc.stdout or ""):
+            print(f"!!! transient Permission denied (attempt {attempt+1}/3), retrying in 5s...")
+            time.sleep(5)
+            continue
+        break
     out = proc.stdout
+    if proc.returncode != 0:
+        tail = "\n".join(out.splitlines()[-40:])
+        print(f"!!! run failed (rc={proc.returncode}). Last 40 lines:\n{tail}")
     val_matches = [float(m) for m in VAL_RE.findall(out)]
     test_matches = [float(m) for m in TEST_RE.findall(out)]
     best_val = max(val_matches) if val_matches else float("nan")
@@ -63,15 +72,12 @@ def sweep(mode, dataset, param, values, schedulers, epochs, seeds,
     param_tag = param.lstrip("-").replace("-", "_")
     rows = []
     for value, sched in product(values, schedulers):
-        vals, tests, rcs, logs = [], [], [], []
+        vals, tests, rcs = [], [], []
         for seed in seeds:
-            log_path = os.path.join(
-                log_dir, f"{mode}_{param_tag}{value}_{sched}_s{seed}.log"
-            )
             extra_seed = [a.format(seed=seed) for a in extra]
             base = base_no_extra + extra_seed
-            v, t, rc = run_one(base, param, value, sched, seed, log_path)
-            vals.append(v); tests.append(t); rcs.append(rc); logs.append(log_path)
+            v, t, rc = run_one(base, param, value, sched, seed)
+            vals.append(v); tests.append(t); rcs.append(rc)
         n_ok = sum(1 for rc in rcs if rc == 0)
         ok_vals = [v for v, rc in zip(vals, rcs) if rc == 0]
         ok_tests = [t for t, rc in zip(tests, rcs) if rc == 0]
@@ -81,34 +87,42 @@ def sweep(mode, dataset, param, values, schedulers, epochs, seeds,
             "value": value, "scheduler": sched,
             "val_mean": v_mean, "val_sem": v_sem,
             "test_mean": t_mean, "test_sem": t_sem,
-            "n_ok": n_ok, "n_total": len(seeds), "logs": logs,
+            "n_ok": n_ok, "n_total": len(seeds),
             # legacy keys for plot.py
             "val": v_mean, "test": t_mean, "rc": 0 if n_ok > 0 else 1,
-            "log": logs[0] if logs else "",
         })
 
     rows.sort(key=lambda r: (r["n_ok"] == 0, -r["val_mean"]
                              if not math.isnan(r["val_mean"]) else float("inf")))
 
-    print("\n" + "=" * 78)
-    print(f"  Sweep — mode={mode}  param={param}  seeds={seeds}  (test hidden)")
-    print("=" * 78)
-    print(f"  {'val_mean':>9} {'±sem':>7}  {param_tag:>10}  {'scheduler':<10}  ok")
+    lines = []
+    lines.append("=" * 78)
+    lines.append(f"  Sweep — mode={mode}  param={param}  seeds={seeds}  (test hidden)")
+    lines.append("=" * 78)
+    lines.append(f"  {'val_mean':>9} {'±sem':>7}  {param_tag:>10}  {'scheduler':<10}  ok")
     for r in rows:
         flag = "" if r["n_ok"] == len(seeds) else f"  [{r['n_ok']}/{r['n_total']}]"
-        print(f"  {r['val_mean']:9.4f} {r['val_sem']:7.4f}  "
-              f"{r['value']:10.1e}  {r['scheduler']:<10}  {r['n_ok']}/{r['n_total']}{flag}")
+        lines.append(f"  {r['val_mean']:9.4f} {r['val_sem']:7.4f}  "
+                     f"{r['value']:10.1e}  {r['scheduler']:<10}  {r['n_ok']}/{r['n_total']}{flag}")
 
     best = next((r for r in rows if r["n_ok"] > 0 and not math.isnan(r["val_mean"])), None)
     if best is not None:
-        print(f"\n  >>> BEST: {param}={best['value']} scheduler={best['scheduler']}  "
-              f"val={best['val_mean']:.4f}±{best['val_sem']:.4f}")
-        # Boundary warning
+        lines.append("")
+        lines.append(f"  >>> BEST: {param}={best['value']} scheduler={best['scheduler']}  "
+                     f"val={best['val_mean']:.4f}±{best['val_sem']:.4f}  "
+                     f"test={best['test_mean']:.4f}±{best['test_sem']:.4f}")
         vmin, vmax = min(values), max(values)
         if best["value"] == vmin:
-            print(f"  ⚠  BEST is at LOWER edge of grid ({vmin:.1e}). Extend the grid downward.")
+            lines.append(f"  ⚠  BEST is at LOWER edge of grid ({vmin:.1e}). Extend the grid downward.")
         elif best["value"] == vmax:
-            print(f"  ⚠  BEST is at UPPER edge of grid ({vmax:.1e}). Extend the grid upward.")
+            lines.append(f"  ⚠  BEST is at UPPER edge of grid ({vmax:.1e}). Extend the grid upward.")
+
+    print("\n" + "\n".join(lines))
+    try:
+        with open(os.path.join(log_dir, "summary.txt"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        print(f"  [summary] could not write summary.txt ({e})")
 
     try:
         from plot import plot_sweep
