@@ -1,4 +1,16 @@
 import argparse
+import json
+import os
+
+# Redirect MNE / MOABB caches away from $HOME (which is not writable here).
+_CACHE_ROOT = "/users/local/REVE-FT/.cache"
+os.makedirs(_CACHE_ROOT, exist_ok=True)
+os.makedirs(os.path.join(_CACHE_ROOT, "mne_data"), exist_ok=True)
+os.environ.setdefault("_MNE_FAKE_HOME_DIR", _CACHE_ROOT)
+os.environ.setdefault("MNE_DATA", os.path.join(_CACHE_ROOT, "mne_data"))
+os.environ.setdefault("MNE_DATASETS_BNCI_PATH", os.environ["MNE_DATA"])
+os.environ.setdefault("MOABB_RESULTS", os.path.join(_CACHE_ROOT, "moabb_results"))
+os.environ.setdefault("XDG_CACHE_HOME", _CACHE_ROOT)
 
 import torch
 from transformers import AutoModel, set_seed
@@ -11,7 +23,7 @@ from stages import (
 )
 
 TIME_PATCHES = {"bciciv2a": 5, "physionet": 3, "zuo2025": 5}
-NUM_CHANNELS = {"bciciv2a": 22, "physionet": 22, "zuo2025": 32}
+NUM_CHANNELS = {"bciciv2a": 22, "physionet": 22, "zuo2025": 30}
 NUM_CLASSES = {"bciciv2a": 4, "physionet": 4, "zuo2025": 2}
 
 
@@ -20,13 +32,12 @@ def parse_args():
     parser.add_argument('--mode', default="linear",
                         choices=["linear", "global", "stacked", "subject_specific"])
     parser.add_argument('--dataset', default="bciciv2a", choices=["bciciv2a", "physionet", "zuo2025"])
-    parser.add_argument('--num-subjects', default=109, type=int, help='PhysioNet: number of subjects to load (max 109)')
+    parser.add_argument('--num-subjects', default=109, type=int, help='Number of subjects to load (PhysioNet max 109, bciciv2a max 9)')
     parser.add_argument('--epochs', default=5, type=int, help='number of epoch')
-    parser.add_argument('--lr', default=0.01, type=float, help='learning rate')
-    parser.add_argument('--scheduler', default='plateau', choices=['plateau', 'cosine', 'constant'],
+    parser.add_argument('--lr', default=2e-3, type=float, help='learning rate')
+    parser.add_argument('--scheduler', default='cosine', choices=['plateau', 'cosine', 'constant'],
                         help='LR scheduler used by every training stage')
-    parser.add_argument('--l1', default=1e-4, type=float, help='L1 regularization strength (0 disables)')
-    parser.add_argument('--batch-size', default=64, type=int, help='batch size')
+    parser.add_argument('--batch-size', default=32, type=int, help='batch size')
     parser.add_argument('--seed', default=None, type=int, help='seed')
     parser.add_argument('--save-final-layer', default=None, type=str, help='path to save the best final layer (linear mode)')
     parser.add_argument('--load-final-layer', default=None, type=str, help='path to load a pretrained final layer')
@@ -34,12 +45,14 @@ def parse_args():
     parser.add_argument('--load-global-lora', default=None, type=str, help='directory to load Global LoRA adapters (skips LP and GL stages)')
     # Per-subject LoRA
     parser.add_argument('--ft-epochs', default=5, type=int, help='per-subject LoRA epochs')
-    parser.add_argument('--ft-lr', default=1e-4, type=float, help='per-subject LoRA learning rate')
+    parser.add_argument('--ft-lr', default=2e-4, type=float, help='per-subject LoRA learning rate')
     parser.add_argument('--lora-rank', default=8, type=int, help='per-subject LoRA rank')
     # Global LoRA (for three_stage and global_lora modes)
     parser.add_argument('--gl-epochs', default=5, type=int, help='global LoRA epochs')
-    parser.add_argument('--gl-lr', default=1e-4, type=float, help='global LoRA learning rate')
+    parser.add_argument('--gl-lr', default=2e-4, type=float, help='global LoRA learning rate')
     parser.add_argument('--gl-rank', default=8, type=int, help='global LoRA rank')
+    parser.add_argument('--results-out', default=None, type=str,
+                        help='path to dump a JSON file with histories + test metrics + per-subject results')
     return parser.parse_args()
 
 
@@ -82,7 +95,27 @@ def main():
         "stacked": run_three_stage,
         "subject_specific": run_two_stage,
     }
-    runners[args.mode](model, pos_bank, args, device)
+
+    results = {
+        "dataset": args.dataset,
+        "mode": args.mode,
+        "seed": args.seed,
+        "scheduler": args.scheduler,
+        "num_subjects": args.num_subjects,
+        "hyperparams": {
+            "lp": {"epochs": args.epochs, "lr": args.lr},
+            "gl": {"epochs": args.gl_epochs, "lr": args.gl_lr, "rank": args.gl_rank},
+            "ft": {"epochs": args.ft_epochs, "lr": args.ft_lr, "rank": args.lora_rank},
+        },
+        "stages": {},
+    }
+    runners[args.mode](model, pos_bank, args, device, results=results)
+
+    if args.results_out:
+        os.makedirs(os.path.dirname(args.results_out) or ".", exist_ok=True)
+        with open(args.results_out, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Results dumped to {args.results_out}")
 
 
 if __name__ == "__main__":

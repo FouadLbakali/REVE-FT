@@ -4,21 +4,27 @@ from sklearn.metrics import balanced_accuracy_score, cohen_kappa_score, f1_score
 from sklearn.preprocessing import label_binarize
 
 
-def _compute_metrics(y_targets, y_decisions, y_probs, n_classes=4):
+def _compute_metrics(y_targets, y_decisions, y_probs, n_classes=None):
     gt = torch.cat(y_targets).cpu().numpy()
     pr = torch.cat(y_decisions).cpu().numpy()
     pr_probs = torch.softmax(torch.cat(y_probs).float(), dim=1).cpu().numpy()
+    if n_classes is None:
+        n_classes = pr_probs.shape[1]
     acc = (gt == pr).mean()
     balanced_acc = balanced_accuracy_score(gt, pr)
     cohen_kappa = cohen_kappa_score(gt, pr)
     f1 = f1_score(gt, pr, average="weighted")
-    auroc = roc_auc_score(gt, pr_probs, multi_class='ovr', labels=list(range(n_classes)))
-    auc_pr = average_precision_score(label_binarize(gt, classes=range(n_classes)), pr_probs, average='macro')
+    if n_classes == 2:
+        auroc = roc_auc_score(gt, pr_probs[:, 1])
+        auc_pr = average_precision_score(gt, pr_probs[:, 1])
+    else:
+        auroc = roc_auc_score(gt, pr_probs, multi_class='ovr', labels=list(range(n_classes)))
+        auc_pr = average_precision_score(label_binarize(gt, classes=range(n_classes)), pr_probs, average='macro')
     return {"acc": acc, "balanced_acc": balanced_acc, "cohen_kappa": cohen_kappa,
             "f1": f1, "auroc": auroc, "auc_pr": auc_pr}
 
 
-def train_one_epoch(model, optimizer, loader, device, use_subject_id=False, l1_lambda=0.0):
+def train_one_epoch(model, optimizer, loader, device, use_subject_id=False):
     criterion = torch.nn.CrossEntropyLoss()
     model.train()
     pbar = tqdm(loader, desc="Training", total=len(loader))
@@ -31,16 +37,12 @@ def train_one_epoch(model, optimizer, loader, device, use_subject_id=False, l1_l
             batch_data["pos"].to(device, non_blocking=True),
         )
         optimizer.zero_grad()
-        with torch.amp.autocast(dtype=torch.float16, device_type="cuda" if torch.cuda.is_available() else "cpu"):
-            if use_subject_id:
-                subject_id = batch_data["subject_id"].to(device, non_blocking=True)
-                output = model(data, pos, subject_id)
-            else:
-                output = model(data, pos)
+        if use_subject_id:
+            subject_id = batch_data["subject_id"].to(device, non_blocking=True)
+            output = model(data, pos, subject_id)
+        else:
+            output = model(data, pos)
         loss = criterion(output, target)
-        if l1_lambda > 0:
-            l1 = sum(p.abs().sum() for p in model.parameters() if p.requires_grad)
-            loss = loss + l1_lambda * l1
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * target.size(0)
@@ -50,7 +52,7 @@ def train_one_epoch(model, optimizer, loader, device, use_subject_id=False, l1_l
 
     return total_loss / count, correct / count
 
-def eval_model(model, loader, device, n_classes=4, use_subject_id=False):
+def eval_model(model, loader, device, n_classes=None, use_subject_id=False):
     model.eval()
 
     y_decisions = []
@@ -65,14 +67,11 @@ def eval_model(model, loader, device, n_classes=4, use_subject_id=False):
                 batch_data["label"].to(device, non_blocking=True),
                 batch_data["pos"].to(device, non_blocking=True),
             )
-            with torch.amp.autocast(
-                dtype=torch.float16, device_type="cuda" if torch.cuda.is_available() else "cpu"
-            ):
-                if use_subject_id:
-                    subject_id = batch_data["subject_id"].to(device, non_blocking=True)
-                    output = model(data, pos, subject_id)
-                else:
-                    output = model(data, pos)
+            if use_subject_id:
+                subject_id = batch_data["subject_id"].to(device, non_blocking=True)
+                output = model(data, pos, subject_id)
+            else:
+                output = model(data, pos)
 
             decisions = torch.argmax(output, dim=1)
             score += (decisions == target).int().sum().item()
@@ -103,10 +102,7 @@ def extract_features(model, loader, device):
     for batch_data in pbar:
         data = batch_data["sample"].to(device, non_blocking=True)
         pos = batch_data["pos"].to(device, non_blocking=True)
-        with torch.amp.autocast(
-            dtype=torch.float16, device_type="cuda" if torch.cuda.is_available() else "cpu"
-        ):
-            feats = model(data, pos)
+        feats = model(data, pos)
         all_features.append(feats.float().cpu())
         all_labels.append(batch_data["label"].cpu())
 
@@ -114,7 +110,7 @@ def extract_features(model, loader, device):
     return torch.cat(all_features), torch.cat(all_labels)
 
 
-def train_head_one_epoch(head, optimizer, features, labels, batch_size, device, l1_lambda=0.0):
+def train_head_one_epoch(head, optimizer, features, labels, batch_size, device):
     """Train the classification head for one epoch on cached features."""
     criterion = torch.nn.CrossEntropyLoss()
     head.train()
@@ -128,14 +124,8 @@ def train_head_one_epoch(head, optimizer, features, labels, batch_size, device, 
         x = features[idx].to(device, non_blocking=True)
         y = labels[idx].to(device, non_blocking=True)
         optimizer.zero_grad()
-        with torch.amp.autocast(
-            dtype=torch.float16, device_type="cuda" if torch.cuda.is_available() else "cpu"
-        ):
-            out = head(x)
+        out = head(x)
         loss = criterion(out, y)
-        if l1_lambda > 0:
-            l1 = sum(p.abs().sum() for p in head.parameters() if p.requires_grad)
-            loss = loss + l1_lambda * l1
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * y.size(0)
@@ -145,7 +135,7 @@ def train_head_one_epoch(head, optimizer, features, labels, batch_size, device, 
     return total_loss / n, correct / n
 
 
-def eval_head(head, features, labels, device, batch_size=256, n_classes=4):
+def eval_head(head, features, labels, device, batch_size=256, n_classes=None):
     """Evaluate the classification head on cached features."""
     head.eval()
     n = features.size(0)
@@ -156,10 +146,7 @@ def eval_head(head, features, labels, device, batch_size=256, n_classes=4):
         for start in pbar:
             x = features[start:start + batch_size].to(device, non_blocking=True)
             y = labels[start:start + batch_size].to(device, non_blocking=True)
-            with torch.amp.autocast(
-                dtype=torch.float16, device_type="cuda" if torch.cuda.is_available() else "cpu"
-            ):
-                out = head(x)
+            out = head(x)
             decisions = torch.argmax(out, dim=1)
             y_decisions.append(decisions)
             y_targets.append(y)

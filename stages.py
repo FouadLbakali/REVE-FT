@@ -19,6 +19,19 @@ from engine import (
 from trainer import train_loop, print_metrics, make_scheduler, _step_scheduler
 
 
+def _floatify(d):
+    return {k: float(v) for k, v in d.items()}
+
+
+def _aggregate_subjects(subject_results):
+    keys = ("acc", "balanced_acc", "cohen_kappa", "f1", "auroc", "auc_pr")
+    out = {}
+    for k in keys:
+        values = [subject_results[s][k] for s in sorted(subject_results)]
+        out[k] = {"mean": float(np.mean(values)), "std": float(np.std(values))}
+    return out
+
+
 def make_lora_config(rank):
     return LoraConfig(
         r=rank,
@@ -40,7 +53,7 @@ def _print_trainable(model):
 # Stages used by the multi-stage runs                                          #
 # --------------------------------------------------------------------------- #
 
-def stage_linear_probing(model, pooled_loaders, args, device):
+def stage_linear_probing(model, pooled_loaders, args, device, results=None):
     pooled_train, pooled_val, pooled_test = pooled_loaders
 
     if args.load_final_layer or getattr(args, "load_global_lora", None):
@@ -49,10 +62,12 @@ def stage_linear_probing(model, pooled_loaders, args, device):
         print(f"  Stage 1 — SKIPPED ({reason})")
         print("=" * 60)
         model.to(device)
+        if results is not None:
+            results.setdefault("stages", {})["lp"] = {"skipped": True, "reason": reason}
         return copy.deepcopy(model.state_dict())
 
     print("=" * 60)
-    print("  Stage 1 — Linear Probing (all subjects)")
+    print("  Stage 1 — Linear Probing (cached features)")
     print("=" * 60)
 
     for param in model.parameters():
@@ -63,25 +78,52 @@ def stage_linear_probing(model, pooled_loaders, args, device):
     _print_trainable(model)
     model.to(device)
 
-    optimizer = torch.optim.AdamW(model.final_layer.parameters(), lr=args.lr)
-    best_head_state = train_loop(
-        model, pooled_train, pooled_val, optimizer, args.epochs, device,
-        l1=args.l1, label="LP", save_module=model.final_layer,
-        scheduler_name=args.scheduler,
-    )
+    print("Extracting cached features (one-shot backbone forward)...")
+    train_features, train_labels = extract_features(model, pooled_train, device)
+    val_features, val_labels = extract_features(model, pooled_val, device)
+    test_features, test_labels = extract_features(model, pooled_test, device)
+    print(f"  Train: {tuple(train_features.shape)} | Val: {tuple(val_features.shape)} | Test: {tuple(test_features.shape)}")
 
-    model.final_layer.load_state_dict(best_head_state)
+    head = model.final_layer
+    optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr)
+    scheduler, needs_metric = make_scheduler(args.scheduler, optimizer, args.epochs)
+
+    best_val = -float("inf")
+    best_head_state = copy.deepcopy(head.state_dict())
+    history = []
+    for epoch in range(args.epochs):
+        print(f"\n[LP] Epoch {epoch + 1}/{args.epochs}")
+        _, train_acc = train_head_one_epoch(
+            head, optimizer, train_features, train_labels, args.batch_size, device
+        )
+        b_acc = eval_head(head, val_features, val_labels, device)["balanced_acc"]
+        if b_acc > best_val:
+            best_val = b_acc
+            best_head_state = copy.deepcopy(head.state_dict())
+        print(f"Train acc: {train_acc:.4f} | Val balanced_acc: {b_acc:.4f} (best: {best_val:.4f})")
+        history.append({"epoch": epoch + 1,
+                        "train_acc": float(train_acc),
+                        "val_balanced_acc": float(b_acc)})
+        _step_scheduler(scheduler, needs_metric, b_acc)
+
+    head.load_state_dict(best_head_state)
     print("\n--- Stage 1 (LP) test results ---")
-    print_metrics(eval_model(model, pooled_test, device))
+    test_metrics = eval_head(head, test_features, test_labels, device)
+    print_metrics(test_metrics)
 
     if args.save_final_layer:
         torch.save(best_head_state, args.save_final_layer)
         print(f"Final layer saved to {args.save_final_layer}")
 
+    if results is not None:
+        results.setdefault("stages", {})["lp"] = {
+            "history": history,
+            "test": _floatify(test_metrics),
+        }
     return copy.deepcopy(model.state_dict())
 
 
-def stage_global_lora(model, pooled_loaders, args, device, checkpoint):
+def stage_global_lora(model, pooled_loaders, args, device, checkpoint, results=None):
     pooled_train, pooled_val, pooled_test = pooled_loaders
 
     if args.load_global_lora:
@@ -92,6 +134,9 @@ def stage_global_lora(model, pooled_loaders, args, device, checkpoint):
         lora_model.to(device)
         print(f"Global LoRA adapters loaded from {args.load_global_lora}")
         merged_model = lora_model.merge_and_unload()
+        if results is not None:
+            results.setdefault("stages", {})["gl"] = {"skipped": True,
+                                                      "loaded_from": args.load_global_lora}
         return merged_model, copy.deepcopy(merged_model.state_dict())
 
     print(f"\n{'=' * 60}")
@@ -106,25 +151,33 @@ def stage_global_lora(model, pooled_loaders, args, device, checkpoint):
     optimizer = torch.optim.AdamW(
         [p for p in lora_model.parameters() if p.requires_grad], lr=args.gl_lr
     )
-    best_state = train_loop(
+    best_state, history = train_loop(
         lora_model, pooled_train, pooled_val, optimizer, args.gl_epochs, device,
-        l1=args.l1, label="GL", scheduler_name=args.scheduler,
+        label="GL", scheduler_name=args.scheduler,
     )
 
     lora_model.load_state_dict(best_state)
     print("\n--- Global LoRA test results ---")
-    print_metrics(eval_model(lora_model, pooled_test, device))
+    test_metrics = eval_model(lora_model, pooled_test, device)
+    print_metrics(test_metrics)
 
     if args.save_global_lora:
         lora_model.save_pretrained(args.save_global_lora)
         print(f"Global LoRA adapters saved to {args.save_global_lora}")
 
+    if results is not None:
+        results.setdefault("stages", {})["gl"] = {
+            "history": history,
+            "test": _floatify(test_metrics),
+        }
+
     merged_model = lora_model.merge_and_unload()
     return merged_model, copy.deepcopy(merged_model.state_dict())
 
 
-def stage_per_subject_lora(model, subject_loaders, args, device, checkpoint):
+def stage_per_subject_lora(model, subject_loaders, args, device, checkpoint, results=None):
     subject_results = {}
+    subjects_block = {} if results is not None else None
 
     for subj, (subj_train, subj_val, subj_test) in sorted(subject_loaders.items()):
         print(f"\n{'=' * 60}")
@@ -139,9 +192,9 @@ def stage_per_subject_lora(model, subject_loaders, args, device, checkpoint):
         optimizer = torch.optim.AdamW(
             [p for p in lora_model.parameters() if p.requires_grad], lr=args.ft_lr
         )
-        best_state = train_loop(
+        best_state, history = train_loop(
             lora_model, subj_train, subj_val, optimizer, args.ft_epochs, device,
-            l1=args.l1, label=f"FT-S{subj}", scheduler_name=args.scheduler,
+            label=f"FT-S{subj}", scheduler_name=args.scheduler,
         )
 
         lora_model.load_state_dict(best_state)
@@ -151,7 +204,20 @@ def stage_per_subject_lora(model, subject_loaders, args, device, checkpoint):
         print(f"\n  --- Subject {subj} test results ---")
         print_metrics(test_metrics)
 
+        if subjects_block is not None:
+            subjects_block[str(subj)] = {
+                "history": history,
+                "test": _floatify(test_metrics),
+                "n_trials": {"train": len(subj_train.dataset),
+                             "val": len(subj_val.dataset),
+                             "test": len(subj_test.dataset)},
+            }
+
         model = lora_model.merge_and_unload()
+
+    if results is not None:
+        results["subjects"] = subjects_block
+        results["aggregate_subjects"] = _aggregate_subjects(subject_results)
 
     return subject_results
 
@@ -169,7 +235,7 @@ def summarize_subject_results(subject_results, title):
 # Top-level run modes                                                          #
 # --------------------------------------------------------------------------- #
 
-def run_linear_probing_cached(model, pos_bank, args, device):
+def run_linear_probing_cached(model, pos_bank, args, device, results=None):
     """Linear probing with feature caching: the backbone forward is run once per
     split, then only the head is trained."""
     train_loader, val_loader, test_loader = load_loaders(
@@ -189,19 +255,23 @@ def run_linear_probing_cached(model, pos_bank, args, device):
     optimizer = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=0.1)
     scheduler, needs_metric = make_scheduler(args.scheduler, optimizer, args.epochs)
 
-    best_val_acc = 0.0
-    best_head_state = None
+    best_val_acc = -float("inf")
+    best_head_state = copy.deepcopy(head.state_dict())
+    history = []
 
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         _, train_acc = train_head_one_epoch(
-            head, optimizer, train_features, train_labels, args.batch_size, device, l1_lambda=args.l1
+            head, optimizer, train_features, train_labels, args.batch_size, device
         )
         b_acc = eval_head(head, val_features, val_labels, device)["balanced_acc"]
         if b_acc > best_val_acc:
             best_val_acc = b_acc
             best_head_state = copy.deepcopy(head.state_dict())
         print(f"Train acc: {train_acc:.4f} | Validation balanced accuracy: {b_acc:.4f}, best: {best_val_acc:.4f}")
+        history.append({"epoch": epoch + 1,
+                        "train_acc": float(train_acc),
+                        "val_balanced_acc": float(b_acc)})
         _step_scheduler(scheduler, needs_metric, b_acc)
 
     head.load_state_dict(best_head_state)
@@ -210,7 +280,14 @@ def run_linear_probing_cached(model, pos_bank, args, device):
         torch.save(best_head_state, args.save_final_layer)
         print(f"Final layer saved to {args.save_final_layer}")
 
-    print_metrics(eval_head(head, test_features, test_labels, device))
+    test_metrics = eval_head(head, test_features, test_labels, device)
+    print_metrics(test_metrics)
+
+    if results is not None:
+        results.setdefault("stages", {})["lp"] = {
+            "history": history,
+            "test": _floatify(test_metrics),
+        }
 
 
 def run_single_stage(model, pos_bank, args, device):
@@ -236,37 +313,37 @@ def run_single_stage(model, pos_bank, args, device):
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.1)
     model.to(device)
 
-    best_state = train_loop(
+    best_state, _ = train_loop(
         model, train_loader, val_loader, optimizer, args.epochs, device,
-        l1=args.l1, save_module=model.final_layer,
+        save_module=model.final_layer,
     )
     model.final_layer.load_state_dict(best_state)
 
     print_metrics(eval_model(model, test_loader, device))
 
 
-def run_two_stage(model, pos_bank, args, device):
+def run_two_stage(model, pos_bank, args, device, results=None):
     pooled_loaders, subject_loaders = load_loaders_per_subject(
         args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
     )
-    lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device)
-    subject_results = stage_per_subject_lora(model, subject_loaders, args, device, lp_checkpoint)
+    lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device, results=results)
+    subject_results = stage_per_subject_lora(model, subject_loaders, args, device, lp_checkpoint, results=results)
     summarize_subject_results(subject_results, "Two-Stage Fine-Tuning — Summary")
 
 
-def run_global_lora(model, pos_bank, args, device):
+def run_global_lora(model, pos_bank, args, device, results=None):
     pooled_loaders, _ = load_loaders_per_subject(
         args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
     )
-    lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device)
-    stage_global_lora(model, pooled_loaders, args, device, lp_checkpoint)
+    lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device, results=results)
+    stage_global_lora(model, pooled_loaders, args, device, lp_checkpoint, results=results)
 
 
-def run_three_stage(model, pos_bank, args, device):
+def run_three_stage(model, pos_bank, args, device, results=None):
     pooled_loaders, subject_loaders = load_loaders_per_subject(
         args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
     )
-    lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device)
-    model, global_checkpoint = stage_global_lora(model, pooled_loaders, args, device, lp_checkpoint)
-    subject_results = stage_per_subject_lora(model, subject_loaders, args, device, global_checkpoint)
+    lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device, results=results)
+    model, global_checkpoint = stage_global_lora(model, pooled_loaders, args, device, lp_checkpoint, results=results)
+    subject_results = stage_per_subject_lora(model, subject_loaders, args, device, global_checkpoint, results=results)
     summarize_subject_results(subject_results, "Three-Stage Fine-Tuning — Summary")

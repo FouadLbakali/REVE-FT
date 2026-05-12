@@ -5,3 +5,7 @@ sweep_logs
 *.pt
 CLAUDE.md
 *.sh
+results/
+mne_data/
+ckpts/
+.cache/

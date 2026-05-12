@@ -1,9 +1,16 @@
+import os
 import socket
 import time
 from functools import partial
+
+_MNE_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mne_data")
+os.makedirs(_MNE_DATA, exist_ok=True)
+os.environ.setdefault("MNE_DATA", _MNE_DATA)
+os.environ.setdefault("MNE_DATASETS_EEGBCI_PATH", _MNE_DATA)
+os.environ.setdefault("MNE_DATASETS_PHYSIONET_PATH", _MNE_DATA)
+
 from moabb.datasets import BNCI2014_001, PhysionetMI, Zuo2025
 from moabb.paradigms import MotorImagery
-from scipy.signal import butter, lfilter
 import numpy as np
 import pandas as pd
 import torch
@@ -27,12 +34,6 @@ class BCIDataset(Dataset):
     def __getitem__(self, idx):
         return {"data": self.X[idx], "labels": self.y[idx], "subject_id": self.subject_ids[idx]}
 
-def butter_bandpass(lowcut, highcut, fs, order=5):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    return butter(order, [low, high], btype="band")
-
 def collate(batch, positions):
     x_data = torch.stack([x["data"] for x in batch])
     y_label = torch.tensor([x["labels"] for x in batch])
@@ -40,14 +41,12 @@ def collate(batch, positions):
     positions = positions.repeat(len(batch), 1, 1)
     return {"sample": x_data, "label": y_label.long(), "pos": positions, "subject_id": subject_ids}
 
-def load_bciciv2a(pos_bank, batch_size, seed=None):
+def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None):
     positions = pos_bank(BCI_CHANNELS)
     paradigm = MotorImagery(n_classes=4, resample=250, fmin=8, fmax=30)
     bci_dataset = BNCI2014_001()
-    X, y, metadata = paradigm.get_data(dataset=bci_dataset)
-
-    b, a = butter_bandpass(8, 30, 250)
-    X = lfilter(b, a, X, axis=-1)
+    subjects_arg = bci_dataset.subject_list[:num_subjects] if num_subjects is not None else None
+    X, y, metadata = paradigm.get_data(dataset=bci_dataset, subjects=subjects_arg)
 
     label_map = {"left_hand": 0, "right_hand": 1, "feet": 2, "tongue": 3}
     y = np.array([label_map[label] for label in y])
@@ -81,9 +80,6 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None):
     paradigm = MotorImagery(n_classes=4, resample=250, fmin=8, fmax=30)
     bci_dataset = BNCI2014_001()
     X, y, metadata = paradigm.get_data(dataset=bci_dataset)
-
-    b, a = butter_bandpass(8, 30, 250)
-    X = lfilter(b, a, X, axis=-1)
 
     label_map = {"left_hand": 0, "right_hand": 1, "feet": 2, "tongue": 3}
     y = np.array([label_map[label] for label in y])
@@ -142,15 +138,19 @@ def _load_physionet_data(num_subjects):
     socket.setdefaulttimeout(300)
 
     paradigm = MotorImagery(
-        n_classes=4, resample=PHYSIONET_RESAMPLE, fmin=8, fmax=30, channels=BCI_CHANNELS
+        n_classes=4, resample=PHYSIONET_RESAMPLE, fmin=8, fmax=30
     )
     mi_dataset = PhysionetMI()
 
     all_X, all_y, all_meta = [], [], []
+    ch_names = None
     for subj in subjects_list:
         for attempt in range(3):
             try:
-                Xi, yi, mi = paradigm.get_data(dataset=mi_dataset, subjects=[subj])
+                epochs_i, yi, mi = paradigm.get_data(dataset=mi_dataset, subjects=[subj], return_epochs=True)
+                if ch_names is None:
+                    ch_names = epochs_i.ch_names
+                Xi = epochs_i.get_data()
                 all_X.append(Xi)
                 all_y.append(yi)
                 all_meta.append(mi)
@@ -176,9 +176,6 @@ def _load_physionet_data(num_subjects):
     usable = (n_samples // PHYSIONET_PATCH_SIZE) * PHYSIONET_PATCH_SIZE
     X = X[:, :, :usable]
 
-    b, a = butter_bandpass(8, 30, PHYSIONET_RESAMPLE)
-    X = lfilter(b, a, X, axis=-1)
-
     # PhysioNet's 4-class paradigm returns "rest" trials we must drop
     label_map = {"left_hand": 0, "right_hand": 1, "feet": 2, "hands": 3}
     keep = np.array([str(label) in label_map for label in y_raw])
@@ -187,12 +184,12 @@ def _load_physionet_data(num_subjects):
     metadata = metadata[keep].reset_index(drop=True)
     y = np.array([label_map[str(label)] for label in y_raw])
 
-    return X, y, metadata
+    return X, y, metadata, ch_names
 
 
 def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10):
-    positions = pos_bank(BCI_CHANNELS)
-    X, y, metadata = _load_physionet_data(num_subjects)
+    X, y, metadata, ch_names = _load_physionet_data(num_subjects)
+    positions = pos_bank(ch_names)
     subject_ids = metadata["subject"].values.astype(int) - 1
 
     n = len(y)
@@ -214,8 +211,8 @@ def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10):
 
 
 def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=10):
-    positions = pos_bank(BCI_CHANNELS)
-    X, y, metadata = _load_physionet_data(num_subjects)
+    X, y, metadata, ch_names = _load_physionet_data(num_subjects)
+    positions = pos_bank(ch_names)
     subjects_raw = metadata["subject"].values.astype(int)
     subject_ids = subjects_raw - 1
 
@@ -258,18 +255,37 @@ def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=
             torch.utils.data.DataLoader(s_test, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
         )
 
+    return pooled_loaders, subject_loaders
 
-def _load_zuo2025_data():
+
+def _load_zuo2025_data(num_subjects=None):
     paradigm = MotorImagery(n_classes=2, resample=250, fmin=8, fmax=30)
     dataset = Zuo2025()
-    epochs, y_raw, metadata = paradigm.get_data(dataset=dataset, return_epochs=True)
-    ch_names = epochs.ch_names
-    X = epochs.get_data()
 
-    b, a = butter_bandpass(8, 30, 250)
-    X = lfilter(b, a, X, axis=-1)
+    subjects_list = dataset.subject_list
+    if num_subjects is not None:
+        subjects_list = subjects_list[:num_subjects]
 
-    label_map = {"left_hand": 0, "right_hand": 1}
+    all_epochs, all_y, all_meta = [], [], []
+    ch_names = None
+    for subj in subjects_list:
+        try:
+            epochs_i, yi, mi = paradigm.get_data(dataset=dataset, subjects=[subj], return_epochs=True)
+        except FileNotFoundError as e:
+            print(f"  Zuo2025 subject {subj} skipped: {e}")
+            continue
+        if ch_names is None:
+            ch_names = epochs_i.ch_names
+        all_epochs.append(epochs_i.get_data())
+        all_y.append(yi)
+        all_meta.append(mi)
+
+    X = np.concatenate(all_epochs, axis=0)
+    X = X * 1e6  # V -> µV: align scale with BCI-IV-2a / PhysioNet (and REVE pretraining)
+    y_raw = np.concatenate(all_y, axis=0)
+    metadata = pd.concat(all_meta, ignore_index=True)
+
+    label_map = {"left_leg": 0, "right_leg": 1}
     keep = np.array([str(label) in label_map for label in y_raw])
     X = X[keep]
     y_raw = y_raw[keep]
@@ -279,8 +295,8 @@ def _load_zuo2025_data():
     return X, y, metadata, ch_names
 
 
-def load_zuo2025(pos_bank, batch_size, seed=None):
-    X, y, metadata, ch_names = _load_zuo2025_data()
+def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None):
+    X, y, metadata, ch_names = _load_zuo2025_data(num_subjects)
     positions = pos_bank(ch_names)
     subject_ids = metadata["subject"].values.astype(int) - 1
 
@@ -302,8 +318,8 @@ def load_zuo2025(pos_bank, batch_size, seed=None):
     return (train_loader, val_loader, test_loader)
 
 
-def load_zuo2025_per_subject(pos_bank, batch_size, seed=None):
-    X, y, metadata, ch_names = _load_zuo2025_data()
+def load_zuo2025_per_subject(pos_bank, batch_size, seed=None, num_subjects=None):
+    X, y, metadata, ch_names = _load_zuo2025_data(num_subjects)
     positions = pos_bank(ch_names)
     subjects_raw = metadata["subject"].values.astype(int)
     subject_ids = subjects_raw - 1
@@ -354,13 +370,13 @@ def load_loaders(dataset, pos_bank, batch_size, seed=None, num_subjects=109):
     if dataset == "physionet":
         return load_physionet_mi(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
     if dataset == "zuo2025":
-        return load_zuo2025(pos_bank, batch_size, seed=seed)
-    return load_bciciv2a(pos_bank, batch_size, seed=seed)
+        return load_zuo2025(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
+    return load_bciciv2a(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
 
 
 def load_loaders_per_subject(dataset, pos_bank, batch_size, seed=None, num_subjects=109):
     if dataset == "physionet":
         return load_physionet_mi_per_subject(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
     if dataset == "zuo2025":
-        return load_zuo2025_per_subject(pos_bank, batch_size, seed=seed)
+        return load_zuo2025_per_subject(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
     return load_bciciv2a_per_subject(pos_bank, batch_size, seed=seed)

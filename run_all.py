@@ -19,6 +19,16 @@ import os
 import subprocess
 import sys
 
+# Redirect MNE / MOABB caches away from $HOME (which is not writable here).
+_CACHE_ROOT = "/users/local/REVE-FT/.cache"
+os.makedirs(_CACHE_ROOT, exist_ok=True)
+os.makedirs(os.path.join(_CACHE_ROOT, "mne_data"), exist_ok=True)
+os.environ["_MNE_FAKE_HOME_DIR"] = _CACHE_ROOT          # -> .mne config dir
+os.environ["MNE_DATA"] = os.path.join(_CACHE_ROOT, "mne_data")
+os.environ["MNE_DATASETS_BNCI_PATH"] = os.environ["MNE_DATA"]
+os.environ["MOABB_RESULTS"] = os.path.join(_CACHE_ROOT, "moabb_results")
+os.environ["XDG_CACHE_HOME"] = _CACHE_ROOT
+
 from sweep import sweep
 
 
