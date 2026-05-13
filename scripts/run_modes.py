@@ -28,12 +28,12 @@ os.environ["MOABB_RESULTS"] = os.path.join(_CACHE_ROOT, "moabb_results")
 os.environ["XDG_CACHE_HOME"] = _CACHE_ROOT
 
 SCHEDULER = "cosine"
-LP_EPOCHS = 30
+LP_EPOCHS = 5
 LP_LR = 2e-3
-GL_EPOCHS = 30
+GL_EPOCHS = 10
 GL_LR = 2e-4
 GL_RANK = 32
-FT_EPOCHS = 30
+FT_EPOCHS = 10
 FT_LR = 2e-4
 FT_RANK = 8
 
@@ -131,7 +131,7 @@ def main():
 
     os.makedirs("ckpts", exist_ok=True)
     seed_tag = f"s{args.seed}"
-    results_root = f"results/{seed_tag}"
+    results_root = f"results/{args.datasets}_{seed_tag}"
     os.makedirs(results_root, exist_ok=True)
 
     plan = []

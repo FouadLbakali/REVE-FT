@@ -23,7 +23,7 @@ from stages import (
 )
 
 TIME_PATCHES = {"bciciv2a": 5, "physionet": 3, "zuo2025": 5}
-NUM_CHANNELS = {"bciciv2a": 22, "physionet": 22, "zuo2025": 30}
+NUM_CHANNELS = {"bciciv2a": 22, "physionet": 64, "zuo2025": 30}
 NUM_CLASSES = {"bciciv2a": 4, "physionet": 4, "zuo2025": 2}
 
 
@@ -44,13 +44,13 @@ def parse_args():
     parser.add_argument('--save-global-lora', default=None, type=str, help='directory to save Global LoRA adapters (PEFT save_pretrained)')
     parser.add_argument('--load-global-lora', default=None, type=str, help='directory to load Global LoRA adapters (skips LP and GL stages)')
     # Per-subject LoRA
-    parser.add_argument('--ft-epochs', default=5, type=int, help='per-subject LoRA epochs')
+    parser.add_argument('--ft-epochs', default=10, type=int, help='per-subject LoRA epochs')
     parser.add_argument('--ft-lr', default=2e-4, type=float, help='per-subject LoRA learning rate')
     parser.add_argument('--lora-rank', default=8, type=int, help='per-subject LoRA rank')
     # Global LoRA (for three_stage and global_lora modes)
-    parser.add_argument('--gl-epochs', default=5, type=int, help='global LoRA epochs')
+    parser.add_argument('--gl-epochs', default=10, type=int, help='global LoRA epochs')
     parser.add_argument('--gl-lr', default=2e-4, type=float, help='global LoRA learning rate')
-    parser.add_argument('--gl-rank', default=8, type=int, help='global LoRA rank')
+    parser.add_argument('--gl-rank', default=32, type=int, help='global LoRA rank')
     parser.add_argument('--results-out', default=None, type=str,
                         help='path to dump a JSON file with histories + test metrics + per-subject results')
     return parser.parse_args()

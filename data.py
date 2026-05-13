@@ -150,7 +150,7 @@ def _load_physionet_data(num_subjects):
                 epochs_i, yi, mi = paradigm.get_data(dataset=mi_dataset, subjects=[subj], return_epochs=True)
                 if ch_names is None:
                     ch_names = epochs_i.ch_names
-                Xi = epochs_i.get_data()
+                Xi = epochs_i.get_data(units="uV")
                 all_X.append(Xi)
                 all_y.append(yi)
                 all_meta.append(mi)
@@ -276,12 +276,11 @@ def _load_zuo2025_data(num_subjects=None):
             continue
         if ch_names is None:
             ch_names = epochs_i.ch_names
-        all_epochs.append(epochs_i.get_data())
+        all_epochs.append(epochs_i.get_data(units="uV"))
         all_y.append(yi)
         all_meta.append(mi)
 
     X = np.concatenate(all_epochs, axis=0)
-    X = X * 1e6  # V -> µV: align scale with BCI-IV-2a / PhysioNet (and REVE pretraining)
     y_raw = np.concatenate(all_y, axis=0)
     metadata = pd.concat(all_meta, ignore_index=True)
 
