@@ -11,15 +11,14 @@ import re
 import subprocess
 import sys
 import time
-from itertools import product
 from statistics import mean, stdev
 
 VAL_RE = re.compile(r"best:\s*([0-9.]+)")
 TEST_RE = re.compile(r"^\s*balanced_acc:\s*([0-9.]+)", re.MULTILINE)
 
 
-def run_one(base_cmd, param, value, sched, seed):
-    cmd = base_cmd + ["--seed", str(seed), param, str(value), "--scheduler", sched]
+def run_one(base_cmd, param, value, seed):
+    cmd = base_cmd + ["--seed", str(seed), param, str(value)]
     print(f"\n>>> {' '.join(cmd)}")
     for attempt in range(3):
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -49,13 +48,12 @@ def _agg(xs):
     return mean(xs), stdev(xs) / math.sqrt(len(xs))
 
 
-def sweep(mode, dataset, param, values, schedulers, epochs, seeds,
+def sweep(mode, dataset, param, values, epochs, seeds,
           num_subjects=109, extra=None, log_dir="sweep_logs"):
     """Run the grid across `seeds` and return (sorted rows, best).
 
-    Each row aggregates the seeds for one (value, scheduler):
-      {value, scheduler, val_mean, val_sem, test_mean, test_sem,
-       n_ok, n_total, logs}
+    Each row aggregates the seeds for one `value`:
+      {value, val_mean, val_sem, test_mean, test_sem, n_ok, n_total, logs}
     Selection is on val_mean. Boundary warning is emitted when the best
     `value` is at min/max of the grid.
     """
@@ -71,12 +69,12 @@ def sweep(mode, dataset, param, values, schedulers, epochs, seeds,
 
     param_tag = param.lstrip("-").replace("-", "_")
     rows = []
-    for value, sched in product(values, schedulers):
+    for value in values:
         vals, tests, rcs = [], [], []
         for seed in seeds:
             extra_seed = [a.format(seed=seed) for a in extra]
             base = base_no_extra + extra_seed
-            v, t, rc = run_one(base, param, value, sched, seed)
+            v, t, rc = run_one(base, param, value, seed)
             vals.append(v); tests.append(t); rcs.append(rc)
         n_ok = sum(1 for rc in rcs if rc == 0)
         ok_vals = [v for v, rc in zip(vals, rcs) if rc == 0]
@@ -84,7 +82,7 @@ def sweep(mode, dataset, param, values, schedulers, epochs, seeds,
         v_mean, v_sem = _agg(ok_vals)
         t_mean, t_sem = _agg(ok_tests)
         rows.append({
-            "value": value, "scheduler": sched,
+            "value": value,
             "val_mean": v_mean, "val_sem": v_sem,
             "test_mean": t_mean, "test_sem": t_sem,
             "n_ok": n_ok, "n_total": len(seeds),
@@ -99,16 +97,16 @@ def sweep(mode, dataset, param, values, schedulers, epochs, seeds,
     lines.append("=" * 78)
     lines.append(f"  Sweep — mode={mode}  param={param}  seeds={seeds}  (test hidden)")
     lines.append("=" * 78)
-    lines.append(f"  {'val_mean':>9} {'±sem':>7}  {param_tag:>10}  {'scheduler':<10}  ok")
+    lines.append(f"  {'val_mean':>9} {'±sem':>7}  {param_tag:>10}  ok")
     for r in rows:
         flag = "" if r["n_ok"] == len(seeds) else f"  [{r['n_ok']}/{r['n_total']}]"
         lines.append(f"  {r['val_mean']:9.4f} {r['val_sem']:7.4f}  "
-                     f"{r['value']:10.1e}  {r['scheduler']:<10}  {r['n_ok']}/{r['n_total']}{flag}")
+                     f"{r['value']:10.1e}  {r['n_ok']}/{r['n_total']}{flag}")
 
     best = next((r for r in rows if r["n_ok"] > 0 and not math.isnan(r["val_mean"])), None)
     if best is not None:
         lines.append("")
-        lines.append(f"  >>> BEST: {param}={best['value']} scheduler={best['scheduler']}  "
+        lines.append(f"  >>> BEST: {param}={best['value']}  "
                      f"val={best['val_mean']:.4f}±{best['val_sem']:.4f}  "
                      f"test={best['test_mean']:.4f}±{best['test_sem']:.4f}")
         vmin, vmax = min(values), max(values)
@@ -140,14 +138,13 @@ def main():
     p.add_argument("--dataset", default="bciciv2a")
     p.add_argument("--param", default="--lr")
     p.add_argument("--values", nargs="+", type=float, default=[1e-3, 3e-3, 1e-2, 3e-2])
-    p.add_argument("--schedulers", nargs="+", default=["plateau", "cosine", "constant"])
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     p.add_argument("--num-subjects", type=int, default=109)
     p.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
     p.add_argument("--log-dir", default="sweep_logs")
     a = p.parse_args()
-    sweep(a.mode, a.dataset, a.param, a.values, a.schedulers, a.epochs,
+    sweep(a.mode, a.dataset, a.param, a.values, a.epochs,
           a.seeds, a.num_subjects, a.extra, a.log_dir)
 
 

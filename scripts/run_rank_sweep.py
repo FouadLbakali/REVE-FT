@@ -38,7 +38,6 @@ from stages import (
 )
 
 RANKS = [1, 2, 4, 8, 16, 32, 64, 128]
-SCHEDULER = "cosine"
 
 
 def _fmt_hms(seconds):
@@ -79,7 +78,6 @@ def _make_args(**kw):
         num_subjects=109,
         epochs=5,
         lr=2e-3,
-        scheduler=SCHEDULER,
         batch_size=32,
         seed=None,
         save_final_layer=None,
@@ -87,11 +85,10 @@ def _make_args(**kw):
         save_global_lora=None,
         load_global_lora=None,
         ft_epochs=1,
-        ft_lr=2e-4,
         lora_rank=8,
         gl_epochs=1,
-        gl_lr=2e-4,
         gl_rank=32,
+        lora_lr=2e-4,
         results_out=None,
     )
     for k, v in kw.items():
@@ -141,7 +138,7 @@ def rank_sweep(mode, model, loaders, lp_checkpoint, args, device, log_dir, eta):
     os.makedirs(log_dir, exist_ok=True)
 
     print(f"\n{'=' * 78}\n  Rank sweep — mode={mode}  ranks={RANKS}  "
-          f"scheduler={SCHEDULER}  seed={args.seed}\n{'=' * 78}")
+          f"seed={args.seed}\n{'=' * 78}")
 
     rows = []
     for rank in RANKS:
@@ -149,15 +146,13 @@ def rank_sweep(mode, model, loaders, lp_checkpoint, args, device, log_dir, eta):
             run_args = _make_args(
                 mode="global", dataset=args.dataset, seed=args.seed,
                 num_subjects=args.num_subjects, batch_size=args.batch_size,
-                scheduler=SCHEDULER,
-                gl_rank=rank, gl_epochs=args.gl_epochs, gl_lr=args.gl_lr,
+                gl_rank=rank, gl_epochs=args.gl_epochs, lora_lr=args.lora_lr,
             )
         else:
             run_args = _make_args(
                 mode="subject_specific", dataset=args.dataset, seed=args.seed,
                 num_subjects=args.num_subjects, batch_size=args.batch_size,
-                scheduler=SCHEDULER,
-                lora_rank=rank, ft_epochs=args.ft_epochs, ft_lr=args.ft_lr,
+                lora_rank=rank, ft_epochs=args.ft_epochs, lora_lr=args.lora_lr,
             )
 
         res = {"stages": {}}
@@ -201,9 +196,8 @@ def main():
     p.add_argument("--lp-epochs", type=int, default=5, help="LP epochs (trained once, shared)")
     p.add_argument("--lp-lr", type=float, default=2e-3)
     p.add_argument("--gl-epochs", type=int, default=1)
-    p.add_argument("--gl-lr", type=float, default=2e-4)
     p.add_argument("--ft-epochs", type=int, default=1)
-    p.add_argument("--ft-lr", type=float, default=2e-4)
+    p.add_argument("--lora-lr", type=float, default=2e-4)
     args = p.parse_args()
 
     log_root = f"sweep_logs/rank_{args.dataset}_s{args.seed}"
@@ -231,7 +225,7 @@ def main():
     lp_args = _make_args(
         mode="linear", dataset=args.dataset, seed=args.seed,
         num_subjects=args.num_subjects, batch_size=args.batch_size,
-        epochs=args.lp_epochs, lr=args.lp_lr, scheduler=SCHEDULER,
+        epochs=args.lp_epochs, lr=args.lp_lr,
     )
     lp_results = {"stages": {}}
     t0 = time.time()
@@ -265,7 +259,7 @@ def main():
               f"{best['val']:8.4f}  {best['test']:8.4f}")
 
     summary = {
-        "dataset": args.dataset, "seed": args.seed, "scheduler": SCHEDULER,
+        "dataset": args.dataset, "seed": args.seed,
         "ranks": RANKS,
         "lp": {
             "epochs": args.lp_epochs, "lr": args.lp_lr,

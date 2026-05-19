@@ -16,52 +16,27 @@ def _ensure_dir(path):
 
 
 def plot_sweep(rows, mode, param, out_path):
-    """Heatmap of val_mean (value × scheduler) + grouped bar with SEM error bars.
+    """Bar plot of val_mean ± SEM over the swept `param` values.
     Test is intentionally NOT plotted to avoid biasing selection."""
     _ensure_dir(out_path)
-    values = sorted({r["value"] for r in rows})
-    scheds = sorted({r["scheduler"] for r in rows})
+    rows = sorted((r for r in rows if r.get("n_ok", 1) > 0),
+                  key=lambda r: r["value"])
+    values = [r["value"] for r in rows]
+    val_m = [r.get("val_mean", r.get("val", np.nan)) for r in rows]
+    val_s = [r.get("val_sem", 0.0) for r in rows]
 
-    val_grid = np.full((len(values), len(scheds)), np.nan)
-    sem_grid = np.full((len(values), len(scheds)), np.nan)
-    for r in rows:
-        if r.get("n_ok", 1) == 0:
-            continue
-        i = values.index(r["value"]); j = scheds.index(r["scheduler"])
-        val_grid[i, j] = r.get("val_mean", r.get("val", np.nan))
-        sem_grid[i, j] = r.get("val_sem", 0.0)
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
-
-    ax = axes[0]
-    im = ax.imshow(val_grid, aspect="auto", cmap="viridis")
-    ax.set_xticks(range(len(scheds)), scheds)
-    ax.set_yticks(range(len(values)), [f"{v:.0e}" for v in values])
-    ax.set_xlabel("scheduler"); ax.set_ylabel(param)
-    ax.set_title("val balanced_acc (mean over seeds)")
-    vmin, vmax = np.nanmin(val_grid), np.nanmax(val_grid)
-    mid = (vmin + vmax) / 2
-    for i in range(len(values)):
-        for j in range(len(scheds)):
-            v, s = val_grid[i, j], sem_grid[i, j]
-            if not np.isnan(v):
-                ax.text(j, i, f"{v:.3f}\n±{s:.3f}", ha="center", va="center",
-                        color="white" if v < mid else "black", fontsize=8)
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    ax = axes[1]
-    width = 0.8 / max(len(scheds), 1)
+    fig, ax = plt.subplots(figsize=(max(6, 1.4 * len(values)), 4.8))
     x = np.arange(len(values))
-    for j, s in enumerate(scheds):
-        ys = [val_grid[i, j] for i in range(len(values))]
-        es = [sem_grid[i, j] for i in range(len(values))]
-        ax.bar(x + j * width, ys, width, yerr=es, capsize=4, label=s)
-    ax.set_xticks(x + width * (len(scheds) - 1) / 2, [f"{v:.0e}" for v in values])
+    bars = ax.bar(x, val_m, 0.6, yerr=val_s, capsize=4, color="#4C78A8")
+    for b, v, s in zip(bars, val_m, val_s):
+        if not np.isnan(v):
+            ax.text(b.get_x() + b.get_width() / 2, v + s,
+                    f"{v:.3f}\n±{s:.3f}", ha="center", va="bottom", fontsize=8)
+    ax.set_xticks(x, [f"{v:.0e}" for v in values])
     ax.set_xlabel(param); ax.set_ylabel("val balanced_acc")
-    ax.set_title("Val ± SEM by scheduler")
-    ax.legend(fontsize=9); ax.grid(axis="y", alpha=0.3)
+    ax.set_title(f"Sweep — mode={mode}  param={param}  (val ± SEM, val only)")
+    ax.grid(axis="y", alpha=0.3)
 
-    fig.suptitle(f"Sweep — mode={mode}  param={param}  (val only)", fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -76,7 +51,7 @@ def plot_summary(summary, out_path):
     test_s = [summary[m].get("test_sem", 0.0) for m in modes]
     val_m = [summary[m].get("val_mean", summary[m].get("val", np.nan)) for m in modes]
     val_s = [summary[m].get("val_sem", 0.0) for m in modes]
-    configs = [f"{summary[m]['value']:.0e} / {summary[m]['scheduler']}" for m in modes]
+    configs = [f"{summary[m]['value']:.0e}" for m in modes]
 
     fig, ax = plt.subplots(figsize=(max(7, 1.7 * len(modes)), 5))
     x = np.arange(len(modes)); width = 0.38

@@ -41,6 +41,52 @@ def collate(batch, positions):
     positions = positions.repeat(len(batch), 1, 1)
     return {"sample": x_data, "label": y_label.long(), "pos": positions, "subject_id": subject_ids}
 
+
+def _per_subject_from_pooled(full_dataset, splits, subjects_raw,
+                             batch_size, collate_fn, seed):
+    """Carve per-subject loaders out of the already-computed pooled splits.
+
+    Each subject's train/val/test is the subset of the *matching* pooled split
+    that belongs to that subject. This guarantees subj_test is a subset of
+    pooled_test, so no trial used in a pooled-data stage (linear probing /
+    global LoRA) can leak into a per-subject test set.
+    """
+    train_ds, val_ds, test_ds = splits
+    subject_loaders = {}
+    for subj in np.unique(subjects_raw):
+        sub = {}
+        for name, split in (("train", train_ds), ("val", val_ds), ("test", test_ds)):
+            idx = [i for i in split.indices if subjects_raw[i] == subj]
+            sub[name] = torch.utils.data.Subset(full_dataset, idx)
+        gen_s = torch.Generator().manual_seed(seed) if seed is not None else torch.Generator()
+        subject_loaders[int(subj)] = (
+            torch.utils.data.DataLoader(sub["train"], batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen_s),
+            torch.utils.data.DataLoader(sub["val"], batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+            torch.utils.data.DataLoader(sub["test"], batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+        )
+    return subject_loaders
+
+
+def _standardize_per_channel(X, train_indices):
+    """Per-channel z-score. Stats fit on the train split only to avoid leakage."""
+    train_X = X[np.asarray(train_indices)]
+    mean = train_X.mean(axis=(0, 2), keepdims=True)
+    std = train_X.std(axis=(0, 2), keepdims=True) + 1e-7
+    return (X - mean) / std
+
+
+def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed):
+    """Split indices, z-score per channel on train stats, then build the dataset."""
+    gen = torch.Generator().manual_seed(seed) if seed is not None else torch.Generator()
+    n = n_train + n_val + n_test
+    train_idx, val_idx, test_idx = random_split(range(n), [n_train, n_val, n_test], generator=gen)
+    X = _standardize_per_channel(X, train_idx.indices)
+    full_dataset = BCIDataset(X, y, subject_ids)
+    splits = tuple(torch.utils.data.Subset(full_dataset, s.indices)
+                   for s in (train_idx, val_idx, test_idx))
+    return full_dataset, splits, gen
+
+
 def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None):
     positions = pos_bank(BCI_CHANNELS)
     paradigm = MotorImagery(n_classes=4, resample=250, fmin=8, fmax=30)
@@ -57,12 +103,11 @@ def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None):
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset = BCIDataset(X, y, subjects)
-    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test])
+    _, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subjects, n_train, n_val, n_test, seed)
 
     collate_fn = partial(collate, positions=positions)
 
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen)
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
@@ -94,39 +139,19 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None):
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset = BCIDataset(X, y, subject_ids)
-
-    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
-    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
 
     pooled_loaders = (
-        torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
+        torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
         torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
         torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
     )
 
-    # Per-subject loaders
-    unique_subjects = sorted(np.unique(subjects_raw))
-    subject_loaders = {}
-    for subj in unique_subjects:
-        mask = (subjects_raw == subj)
-        subj_X, subj_y = X[mask], y[mask]
-        subj_ids = subject_ids[mask]
-        subj_dataset = BCIDataset(subj_X, subj_y, subj_ids)
-
-        sn = len(subj_y)
-        sn_train = int(0.7 * sn)
-        sn_val = int(0.15 * sn)
-        sn_test = sn - sn_train - sn_val
-
-        gen_s = torch.Generator().manual_seed(seed) if seed else torch.Generator()
-        s_train, s_val, s_test = random_split(subj_dataset, [sn_train, sn_val, sn_test], generator=gen_s)
-
-        subject_loaders[subj] = (
-            torch.utils.data.DataLoader(s_train, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
-            torch.utils.data.DataLoader(s_val, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
-            torch.utils.data.DataLoader(s_test, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
-        )
+    # Per-subject loaders carved out of the pooled splits (no leakage).
+    subject_loaders = _per_subject_from_pooled(
+        full_dataset, (train_ds, val_ds, test_ds), subjects_raw,
+        batch_size, collate_fn, seed,
+    )
 
     return pooled_loaders, subject_loaders
 
@@ -196,14 +221,11 @@ def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10):
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset = BCIDataset(X, y, subject_ids)
-
-    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
-    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+    _, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
 
     collate_fn = partial(collate, positions=positions)
 
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen)
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
@@ -222,38 +244,18 @@ def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset = BCIDataset(X, y, subject_ids)
-
-    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
-    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
 
     pooled_loaders = (
-        torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
+        torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
         torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
         torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
     )
 
-    unique_subjects = sorted(np.unique(subjects_raw))
-    subject_loaders = {}
-    for subj in unique_subjects:
-        mask = (subjects_raw == subj)
-        subj_X, subj_y = X[mask], y[mask]
-        subj_ids = subject_ids[mask]
-        subj_dataset = BCIDataset(subj_X, subj_y, subj_ids)
-
-        sn = len(subj_y)
-        sn_train = int(0.7 * sn)
-        sn_val = int(0.15 * sn)
-        sn_test = sn - sn_train - sn_val
-
-        gen_s = torch.Generator().manual_seed(seed) if seed else torch.Generator()
-        s_train, s_val, s_test = random_split(subj_dataset, [sn_train, sn_val, sn_test], generator=gen_s)
-
-        subject_loaders[int(subj)] = (
-            torch.utils.data.DataLoader(s_train, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
-            torch.utils.data.DataLoader(s_val, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
-            torch.utils.data.DataLoader(s_test, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
-        )
+    subject_loaders = _per_subject_from_pooled(
+        full_dataset, (train_ds, val_ds, test_ds), subjects_raw,
+        batch_size, collate_fn, seed,
+    )
 
     return pooled_loaders, subject_loaders
 
@@ -303,14 +305,11 @@ def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None):
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset = BCIDataset(X, y, subject_ids)
-
-    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
-    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+    _, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
 
     collate_fn = partial(collate, positions=positions)
 
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen)
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
@@ -329,38 +328,18 @@ def load_zuo2025_per_subject(pos_bank, batch_size, seed=None, num_subjects=None)
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset = BCIDataset(X, y, subject_ids)
-
-    gen = torch.Generator().manual_seed(seed) if seed else torch.Generator()
-    train_ds, val_ds, test_ds = random_split(full_dataset, [n_train, n_val, n_test], generator=gen)
+    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
 
     pooled_loaders = (
-        torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
+        torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
         torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
         torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
     )
 
-    unique_subjects = sorted(np.unique(subjects_raw))
-    subject_loaders = {}
-    for subj in unique_subjects:
-        mask = (subjects_raw == subj)
-        subj_X, subj_y = X[mask], y[mask]
-        subj_ids = subject_ids[mask]
-        subj_dataset = BCIDataset(subj_X, subj_y, subj_ids)
-
-        sn = len(subj_y)
-        sn_train = int(0.7 * sn)
-        sn_val = int(0.15 * sn)
-        sn_test = sn - sn_train - sn_val
-
-        gen_s = torch.Generator().manual_seed(seed) if seed else torch.Generator()
-        s_train, s_val, s_test = random_split(subj_dataset, [sn_train, sn_val, sn_test], generator=gen_s)
-
-        subject_loaders[int(subj)] = (
-            torch.utils.data.DataLoader(s_train, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
-            torch.utils.data.DataLoader(s_val, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
-            torch.utils.data.DataLoader(s_test, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
-        )
+    subject_loaders = _per_subject_from_pooled(
+        full_dataset, (train_ds, val_ds, test_ds), subjects_raw,
+        batch_size, collate_fn, seed,
+    )
 
     return pooled_loaders, subject_loaders
 

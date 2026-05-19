@@ -24,7 +24,6 @@ from sweep import run_one
 DATASET = "zuo2025"
 MODE = "linear"
 EPOCHS = 1
-SCHEDULER = "cosine"
 LRS = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1]
 
 
@@ -49,14 +48,14 @@ def main():
             "--epochs", str(EPOCHS)]
 
     print(f"\n{'=' * 78}\n  LR sweep — mode={MODE}  dataset={DATASET}  "
-          f"epochs={EPOCHS}  scheduler={SCHEDULER}  seed={args.seed}\n"
+          f"epochs={EPOCHS}  seed={args.seed}\n"
           f"  lrs={args.lrs}\n{'=' * 78}")
 
     rows = []
     t_start = time.time()
     for i, lr in enumerate(args.lrs, 1):
         t0 = time.time()
-        val, test, rc = run_one(base, "--lr", lr, SCHEDULER, args.seed)
+        val, test, rc = run_one(base, "--lr", lr, args.seed)
         dt = time.time() - t0
         rows.append({"lr": lr, "val": val, "test": test, "rc": rc, "seconds": dt})
         wall = time.time() - t_start
@@ -92,7 +91,7 @@ def main():
         f.write("\n".join(lines) + "\n")
     with open(os.path.join(log_dir, "rows.json"), "w") as f:
         json.dump({"dataset": DATASET, "mode": MODE, "epochs": EPOCHS,
-                   "scheduler": SCHEDULER, "seed": args.seed,
+                   "seed": args.seed,
                    "lrs": args.lrs, "rows": rows, "best": best}, f, indent=2)
     print(f"\n  Summary -> {log_dir}/")
 

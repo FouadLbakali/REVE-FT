@@ -1,6 +1,6 @@
 """Run `stacked` and `subject_specific` on bciciv2a, physionet, zuo2025.
 
-Pipeline per dataset (single seed, cosine scheduler):
+Pipeline per dataset (single seed):
   1. stacked           -> trains LP + Global LoRA + per-subject in one run;
                           saves LP        -> ckpts/lp_<ds>_s<seed>.pt
                           saves Global LoRA -> ckpts/gl_<ds>_s<seed>/
@@ -27,15 +27,13 @@ os.environ["MNE_DATASETS_BNCI_PATH"] = os.environ["MNE_DATA"]
 os.environ["MOABB_RESULTS"] = os.path.join(_CACHE_ROOT, "moabb_results")
 os.environ["XDG_CACHE_HOME"] = _CACHE_ROOT
 
-SCHEDULER = "cosine"
 LP_EPOCHS = 5
 LP_LR = 2e-3
 GL_EPOCHS = 10
-GL_LR = 2e-4
 GL_RANK = 32
 FT_EPOCHS = 10
-FT_LR = 2e-4
 FT_RANK = 8
+LORA_LR = 2e-4
 
 STEP_ORDER = ["ST", "SS"]
 
@@ -91,10 +89,10 @@ def step_stacked(dataset, seed, num_subjects, lp_ckpt, gl_ckpt, results_out):
     cmd = [sys.executable, "main.py",
            "--mode", "stacked", "--dataset", dataset,
            "--seed", str(seed), "--num-subjects", str(num_subjects),
-           "--scheduler", SCHEDULER,
            "--epochs", str(LP_EPOCHS), "--lr", str(LP_LR),
-           "--gl-epochs", str(GL_EPOCHS), "--gl-lr", str(GL_LR), "--gl-rank", str(GL_RANK),
-           "--ft-epochs", str(FT_EPOCHS), "--ft-lr", str(FT_LR), "--lora-rank", str(FT_RANK),
+           "--gl-epochs", str(GL_EPOCHS), "--gl-rank", str(GL_RANK),
+           "--ft-epochs", str(FT_EPOCHS), "--lora-rank", str(FT_RANK),
+           "--lora-lr", str(LORA_LR),
            "--save-final-layer", lp_ckpt,
            "--save-global-lora", gl_ckpt,
            "--results-out", results_out]
@@ -105,8 +103,8 @@ def step_subject_specific(dataset, seed, num_subjects, lp_ckpt, results_out):
     cmd = [sys.executable, "main.py",
            "--mode", "subject_specific", "--dataset", dataset,
            "--seed", str(seed), "--num-subjects", str(num_subjects),
-           "--scheduler", SCHEDULER,
-           "--ft-epochs", str(FT_EPOCHS), "--ft-lr", str(FT_LR), "--lora-rank", str(FT_RANK),
+           "--ft-epochs", str(FT_EPOCHS), "--lora-rank", str(FT_RANK),
+           "--lora-lr", str(LORA_LR),
            "--load-final-layer", lp_ckpt,
            "--results-out", results_out]
     _run(cmd, f"[{dataset}] subject_specific (LP loaded + per-subject)")
@@ -141,10 +139,11 @@ def main():
 
     print("=" * 78)
     print(f"  Plan: {len(args.datasets)} datasets × {len(STEP_ORDER)} modes = {len(plan)} runs")
-    print(f"  datasets={args.datasets}  seed={args.seed}  scheduler={SCHEDULER}")
+    print(f"  datasets={args.datasets}  seed={args.seed}")
     print(f"  LP (in stacked): epochs={LP_EPOCHS}  lr={LP_LR}")
-    print(f"  GL (in stacked): epochs={GL_EPOCHS}  lr={GL_LR}  rank={GL_RANK}")
-    print(f"  FT             : epochs={FT_EPOCHS}  lr={FT_LR}  rank={FT_RANK}")
+    print(f"  GL (in stacked): epochs={GL_EPOCHS}  rank={GL_RANK}")
+    print(f"  FT             : epochs={FT_EPOCHS}  rank={FT_RANK}")
+    print(f"  LoRA lr (GL+FT): {LORA_LR}")
     print("=" * 78)
 
     runs = []
@@ -172,10 +171,10 @@ def main():
 
 def _write_summary(runs, results_root, total_wall, args):
     """Combined .json + human-readable .txt across all (dataset, mode) results."""
-    combined = {"seed": args.seed, "scheduler": SCHEDULER,
+    combined = {"seed": args.seed,
                 "datasets": args.datasets, "wall_seconds": total_wall, "runs": {}}
     txt_lines = ["=" * 78,
-                 f"  RESULTS SUMMARY — seed={args.seed} scheduler={SCHEDULER}",
+                 f"  RESULTS SUMMARY — seed={args.seed}",
                  f"  wall time: {_fmt_hms(total_wall)}",
                  "=" * 78]
 
