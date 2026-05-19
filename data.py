@@ -14,6 +14,7 @@ from moabb.paradigms import MotorImagery
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 from torch.utils.data import Dataset, random_split
 
 BCI_CHANNELS = ["Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
@@ -67,6 +68,36 @@ def _per_subject_from_pooled(full_dataset, splits, subjects_raw,
     return subject_loaders
 
 
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+
+def _load_pp(model_name):
+    """Per-model input-preprocessing config from models/<model_name>.yaml.
+
+    The yaml mirrors the upstream LaBraM `data.neuro` schema; this maps it to
+    the filter/resample/normalize settings the loaders consume. `scaler: null`
+    (LaBraM) means no scaler plus the fixed `scale_factor` (given in V units
+    while MOABB hands us microvolts, so it becomes scale_factor / 1e6) and a
+    trim to whole `frequency`-sample patches; `scaler: StandardScaler` (REVE)
+    means per-channel z-score on train stats.
+    """
+    with open(os.path.join(_MODELS_DIR, f"{model_name}.yaml")) as f:
+        neuro = yaml.safe_load(f)["data"]["neuro"]
+    fmin, fmax = neuro["filter"]
+    notch = neuro["notch_filter"]
+    freq = int(neuro["frequency"])
+    is_labram = neuro["scaler"] is None
+    return {
+        "fmin": fmin,
+        "fmax": fmax,
+        "resample": freq,
+        "notch": notch[0] if notch else None,
+        "normalize": "labram" if is_labram else "zscore",
+        "patch_trim": freq if is_labram else None,
+        "scale": (neuro["scale_factor"] or 1e6) / 1e6,
+    }
+
+
 def _standardize_per_channel(X, train_indices):
     """Per-channel z-score. Stats fit on the train split only to avoid leakage."""
     train_X = X[np.asarray(train_indices)]
@@ -75,24 +106,45 @@ def _standardize_per_channel(X, train_indices):
     return (X - mean) / std
 
 
-def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed):
-    """Split indices, z-score per channel on train stats, then build the dataset."""
+def _apply_notch(X, sfreq, freq):
+    """In-band line-noise notch (LaBraM keeps up to 75 Hz, so 50 Hz must go)."""
+    from mne.filter import notch_filter
+
+    return notch_filter(X.astype(np.float64), sfreq, freqs=freq,
+                        method="iir", verbose=False)
+
+
+def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed,
+                   normalize="zscore", scale=1.0):
+    """Split indices, normalize, then build the dataset. `normalize="zscore"`
+    (REVE, default) z-scores per channel on train stats; `"labram"` applies no
+    scaler and the fixed uV-input `scale` (see models/labram.yaml)."""
     gen = torch.Generator().manual_seed(seed) if seed is not None else torch.Generator()
     n = n_train + n_val + n_test
     train_idx, val_idx, test_idx = random_split(range(n), [n_train, n_val, n_test], generator=gen)
-    X = _standardize_per_channel(X, train_idx.indices)
+    if normalize == "labram":
+        X = X * scale
+    else:
+        X = _standardize_per_channel(X, train_idx.indices)
     full_dataset = BCIDataset(X, y, subject_ids)
     splits = tuple(torch.utils.data.Subset(full_dataset, s.indices)
                    for s in (train_idx, val_idx, test_idx))
     return full_dataset, splits, gen
 
 
-def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None):
+def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None,
+                  resample=250, patch_trim=None, fmin=8.0, fmax=30.0,
+                  notch=None, normalize="zscore", scale=1.0):
     positions = pos_bank(BCI_CHANNELS)
-    paradigm = MotorImagery(n_classes=4, resample=250, fmin=8, fmax=30)
+    paradigm = MotorImagery(n_classes=4, resample=resample, fmin=fmin, fmax=fmax)
     bci_dataset = BNCI2014_001()
     subjects_arg = bci_dataset.subject_list[:num_subjects] if num_subjects is not None else None
     X, y, metadata = paradigm.get_data(dataset=bci_dataset, subjects=subjects_arg)
+
+    if notch:
+        X = _apply_notch(X, resample, notch)
+    if patch_trim:  # keep a whole number of temporal patches (LaBraM)
+        X = X[:, :, : (X.shape[-1] // patch_trim) * patch_trim]
 
     label_map = {"left_hand": 0, "right_hand": 1, "feet": 2, "tongue": 3}
     y = np.array([label_map[label] for label in y])
@@ -103,7 +155,8 @@ def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None):
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    _, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subjects, n_train, n_val, n_test, seed)
+    _, (train_ds, val_ds, test_ds), gen = _split_dataset(
+        X, y, subjects, n_train, n_val, n_test, seed, normalize=normalize, scale=scale)
 
     collate_fn = partial(collate, positions=positions)
 
@@ -111,20 +164,28 @@ def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None):
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    return (train_loader, val_loader, test_loader)
+    return (train_loader, val_loader, test_loader), BCI_CHANNELS
 
 
-def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None):
+def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None,
+                              resample=250, patch_trim=None, fmin=8.0, fmax=30.0,
+                              notch=None, normalize="zscore", scale=1.0):
     """Return per-subject data loaders for two-stage fine-tuning.
 
     Returns:
         pooled_loaders: (train, val, test) loaders on all subjects
         subject_loaders: dict mapping subject_id -> (train, val, test) loaders
+        ch_names: channel names (for LaBraM montage construction)
     """
     positions = pos_bank(BCI_CHANNELS)
-    paradigm = MotorImagery(n_classes=4, resample=250, fmin=8, fmax=30)
+    paradigm = MotorImagery(n_classes=4, resample=resample, fmin=fmin, fmax=fmax)
     bci_dataset = BNCI2014_001()
     X, y, metadata = paradigm.get_data(dataset=bci_dataset)
+
+    if notch:
+        X = _apply_notch(X, resample, notch)
+    if patch_trim:  # keep a whole number of temporal patches (LaBraM)
+        X = X[:, :, : (X.shape[-1] // patch_trim) * patch_trim]
 
     label_map = {"left_hand": 0, "right_hand": 1, "feet": 2, "tongue": 3}
     y = np.array([label_map[label] for label in y])
@@ -139,7 +200,9 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None):
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
+    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(
+        X, y, subject_ids, n_train, n_val, n_test, seed,
+        normalize=normalize, scale=scale)
 
     pooled_loaders = (
         torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
@@ -153,17 +216,17 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None):
         batch_size, collate_fn, seed,
     )
 
-    return pooled_loaders, subject_loaders
+    return pooled_loaders, subject_loaders, BCI_CHANNELS
 
 
-def _load_physionet_data(num_subjects):
+def _load_physionet_data(num_subjects, fmin=8.0, fmax=30.0):
     subjects_list = list(range(1, num_subjects + 1))
 
     prev_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(300)
 
     paradigm = MotorImagery(
-        n_classes=4, resample=PHYSIONET_RESAMPLE, fmin=8, fmax=30
+        n_classes=4, resample=PHYSIONET_RESAMPLE, fmin=fmin, fmax=fmax
     )
     mi_dataset = PhysionetMI()
 
@@ -212,8 +275,11 @@ def _load_physionet_data(num_subjects):
     return X, y, metadata, ch_names
 
 
-def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10):
-    X, y, metadata, ch_names = _load_physionet_data(num_subjects)
+def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10,
+                      fmin=8.0, fmax=30.0, notch=None, normalize="zscore", scale=1.0):
+    X, y, metadata, ch_names = _load_physionet_data(num_subjects, fmin=fmin, fmax=fmax)
+    if notch:
+        X = _apply_notch(X, PHYSIONET_RESAMPLE, notch)
     positions = pos_bank(ch_names)
     subject_ids = metadata["subject"].values.astype(int) - 1
 
@@ -221,7 +287,8 @@ def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10):
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    _, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
+    _, (train_ds, val_ds, test_ds), gen = _split_dataset(
+        X, y, subject_ids, n_train, n_val, n_test, seed, normalize=normalize, scale=scale)
 
     collate_fn = partial(collate, positions=positions)
 
@@ -229,11 +296,17 @@ def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10):
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    return (train_loader, val_loader, test_loader)
+    # PhysioNet is already 200 Hz, trimmed to a whole number of 200-sample
+    # patches (see _load_physionet_data), so it is LaBraM-ready as-is.
+    return (train_loader, val_loader, test_loader), ch_names
 
 
-def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=10):
-    X, y, metadata, ch_names = _load_physionet_data(num_subjects)
+def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=10,
+                                  fmin=8.0, fmax=30.0, notch=None,
+                                  normalize="zscore", scale=1.0):
+    X, y, metadata, ch_names = _load_physionet_data(num_subjects, fmin=fmin, fmax=fmax)
+    if notch:
+        X = _apply_notch(X, PHYSIONET_RESAMPLE, notch)
     positions = pos_bank(ch_names)
     subjects_raw = metadata["subject"].values.astype(int)
     subject_ids = subjects_raw - 1
@@ -244,7 +317,9 @@ def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
+    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(
+        X, y, subject_ids, n_train, n_val, n_test, seed,
+        normalize=normalize, scale=scale)
 
     pooled_loaders = (
         torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
@@ -257,11 +332,11 @@ def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=
         batch_size, collate_fn, seed,
     )
 
-    return pooled_loaders, subject_loaders
+    return pooled_loaders, subject_loaders, ch_names
 
 
-def _load_zuo2025_data(num_subjects=None):
-    paradigm = MotorImagery(n_classes=2, resample=250, fmin=8, fmax=30)
+def _load_zuo2025_data(num_subjects=None, resample=250, fmin=8.0, fmax=30.0):
+    paradigm = MotorImagery(n_classes=2, resample=resample, fmin=fmin, fmax=fmax)
     dataset = Zuo2025()
 
     subjects_list = dataset.subject_list
@@ -296,8 +371,15 @@ def _load_zuo2025_data(num_subjects=None):
     return X, y, metadata, ch_names
 
 
-def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None):
-    X, y, metadata, ch_names = _load_zuo2025_data(num_subjects)
+def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None,
+                 resample=250, patch_trim=None, fmin=8.0, fmax=30.0,
+                 notch=None, normalize="zscore", scale=1.0):
+    X, y, metadata, ch_names = _load_zuo2025_data(
+        num_subjects, resample=resample, fmin=fmin, fmax=fmax)
+    if notch:
+        X = _apply_notch(X, resample, notch)
+    if patch_trim:  # keep a whole number of temporal patches (LaBraM)
+        X = X[:, :, : (X.shape[-1] // patch_trim) * patch_trim]
     positions = pos_bank(ch_names)
     subject_ids = metadata["subject"].values.astype(int) - 1
 
@@ -305,7 +387,8 @@ def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None):
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    _, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
+    _, (train_ds, val_ds, test_ds), gen = _split_dataset(
+        X, y, subject_ids, n_train, n_val, n_test, seed, normalize=normalize, scale=scale)
 
     collate_fn = partial(collate, positions=positions)
 
@@ -313,11 +396,18 @@ def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None):
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    return (train_loader, val_loader, test_loader)
+    return (train_loader, val_loader, test_loader), ch_names
 
 
-def load_zuo2025_per_subject(pos_bank, batch_size, seed=None, num_subjects=None):
-    X, y, metadata, ch_names = _load_zuo2025_data(num_subjects)
+def load_zuo2025_per_subject(pos_bank, batch_size, seed=None, num_subjects=None,
+                             resample=250, patch_trim=None, fmin=8.0, fmax=30.0,
+                             notch=None, normalize="zscore", scale=1.0):
+    X, y, metadata, ch_names = _load_zuo2025_data(
+        num_subjects, resample=resample, fmin=fmin, fmax=fmax)
+    if notch:
+        X = _apply_notch(X, resample, notch)
+    if patch_trim:  # keep a whole number of temporal patches (LaBraM)
+        X = X[:, :, : (X.shape[-1] // patch_trim) * patch_trim]
     positions = pos_bank(ch_names)
     subjects_raw = metadata["subject"].values.astype(int)
     subject_ids = subjects_raw - 1
@@ -328,7 +418,9 @@ def load_zuo2025_per_subject(pos_bank, batch_size, seed=None, num_subjects=None)
     n_train = int(0.7 * n)
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
-    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed)
+    full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(
+        X, y, subject_ids, n_train, n_val, n_test, seed,
+        normalize=normalize, scale=scale)
 
     pooled_loaders = (
         torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
@@ -341,20 +433,47 @@ def load_zuo2025_per_subject(pos_bank, batch_size, seed=None, num_subjects=None)
         batch_size, collate_fn, seed,
     )
 
-    return pooled_loaders, subject_loaders
+    return pooled_loaders, subject_loaders, ch_names
 
 
-def load_loaders(dataset, pos_bank, batch_size, seed=None, num_subjects=109):
+def load_loaders(dataset, pos_bank, batch_size, seed=None, num_subjects=109,
+                 model_name="reve"):
+    """Returns ((train, val, test), ch_names). Per-model input preprocessing
+    is read from models/<model_name>.yaml (labram: 0.1-75 Hz, 50 Hz notch,
+    200 Hz, no scaler, uV->0.1 mV; reve: 8-30 Hz, z-scored)."""
+    pp = _load_pp("labram" if model_name == "labram" else "reve")
+    flt = {"fmin": pp["fmin"], "fmax": pp["fmax"], "notch": pp["notch"],
+           "normalize": pp["normalize"], "scale": pp["scale"]}
+    # PhysioNet is fixed at 200 Hz internally (PHYSIONET_RESAMPLE) and already
+    # trimmed to whole 200-sample patches, so it takes no resample/patch_trim.
     if dataset == "physionet":
-        return load_physionet_mi(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
+        return load_physionet_mi(pos_bank, batch_size, seed=seed,
+                                 num_subjects=num_subjects, **flt)
+    resample = pp.get("resample", 250)
     if dataset == "zuo2025":
-        return load_zuo2025(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
-    return load_bciciv2a(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
+        return load_zuo2025(pos_bank, batch_size, seed=seed, num_subjects=num_subjects,
+                            resample=resample, patch_trim=pp["patch_trim"], **flt)
+    return load_bciciv2a(pos_bank, batch_size, seed=seed, num_subjects=num_subjects,
+                         resample=resample, patch_trim=pp["patch_trim"], **flt)
 
 
-def load_loaders_per_subject(dataset, pos_bank, batch_size, seed=None, num_subjects=109):
+def load_loaders_per_subject(dataset, pos_bank, batch_size, seed=None,
+                             num_subjects=109, model_name="reve"):
+    """Returns (pooled_loaders, subject_loaders, ch_names). Per-model input
+    preprocessing is read from models/<model_name>.yaml, identically to
+    load_loaders (labram: 0.1-75 Hz, 50 Hz notch, 200 Hz, no scaler,
+    uV->0.1 mV; reve: 8-30 Hz, z-scored)."""
+    pp = _load_pp("labram" if model_name == "labram" else "reve")
+    flt = {"fmin": pp["fmin"], "fmax": pp["fmax"], "notch": pp["notch"],
+           "normalize": pp["normalize"], "scale": pp["scale"]}
     if dataset == "physionet":
-        return load_physionet_mi_per_subject(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
+        return load_physionet_mi_per_subject(
+            pos_bank, batch_size, seed=seed, num_subjects=num_subjects, **flt)
+    resample = pp.get("resample", 250)
     if dataset == "zuo2025":
-        return load_zuo2025_per_subject(pos_bank, batch_size, seed=seed, num_subjects=num_subjects)
-    return load_bciciv2a_per_subject(pos_bank, batch_size, seed=seed)
+        return load_zuo2025_per_subject(
+            pos_bank, batch_size, seed=seed, num_subjects=num_subjects,
+            resample=resample, patch_trim=pp["patch_trim"], **flt)
+    return load_bciciv2a_per_subject(
+        pos_bank, batch_size, seed=seed,
+        resample=resample, patch_trim=pp["patch_trim"], **flt)

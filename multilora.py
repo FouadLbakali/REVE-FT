@@ -83,22 +83,24 @@ class MultiSubjectLoraLinear(nn.Module):
         return out + delta.reshape(*shape[:-1], out.shape[-1])
 
 
-TARGET_SUFFIXES = ("to_qkv", "to_out", "net.1", "net.3")
+TARGET_SUFFIXES = ("to_qkv", "to_out", "net.1", "net.3")  # REVE defaults
 
 
-def _is_target(name: str) -> bool:
-    return any(name == s or name.endswith("." + s) for s in TARGET_SUFFIXES)
+def _is_target(name: str, suffixes) -> bool:
+    return any(name == s or name.endswith("." + s) for s in suffixes)
 
 
 def inject_multi_subject_lora(model, num_subjects, rank, alpha=32, dropout=0.05,
-                              global_rank=0, global_alpha=32):
+                              global_rank=0, global_alpha=32,
+                              target_suffixes=TARGET_SUFFIXES):
     """Replace the targeted Linears with MultiSubjectLoraLinear, freeze the
     backbone, keep `final_layer` (the shared head) trainable. With global_rank>0
     each layer also gets a shared global LoRA adapter trained jointly.
+    `target_suffixes` selects which Linears to wrap (backbone-specific).
 
     Returns (model, n_replaced)."""
     targets = [(n, m) for n, m in model.named_modules()
-               if isinstance(m, nn.Linear) and _is_target(n)]
+               if isinstance(m, nn.Linear) and _is_target(n, target_suffixes)]
     for name, module in targets:
         parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
         setattr(parent, name.rsplit(".", 1)[-1],

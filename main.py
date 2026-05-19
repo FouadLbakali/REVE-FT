@@ -15,6 +15,7 @@ os.environ.setdefault("XDG_CACHE_HOME", _CACHE_ROOT)
 import torch
 from transformers import AutoModel, set_seed
 
+from labram_zoo import LabramSpec
 from stages import (
     run_global_lora,
     run_joint_lora,
@@ -38,6 +39,10 @@ def parse_args():
                         choices=["linear", "global", "joint", "stacked", "subject_specific",
                                  "joint_stacked", "joint_subject_specific", "joint_multilora",
                                  "joint_multilora_global"])
+    parser.add_argument('--model', default="reve", choices=["reve", "labram"],
+                        help='backbone: reve (brain-bzh/reve-base) or labram '
+                             '(braindecode/labram-pretrained); labram supports --mode '
+                             'linear, joint, joint_multilora and joint_multilora_global')
     parser.add_argument('--pooling', default="flatten",
                         choices=["flatten", "mean"])
     parser.add_argument('--dataset', default="bciciv2a", choices=["bciciv2a", "physionet", "zuo2025"])
@@ -63,9 +68,16 @@ def parse_args():
                         help='path to dump a JSON file with histories + test metrics + per-subject results')
     return parser.parse_args()
 
-def build_model(dataset, load_final_layer=None, pooling="flatten"):
-    model = AutoModel.from_pretrained("brain-bzh/reve-base", trust_remote_code=True, dtype="auto")
+def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="reve"):
     pos_bank = AutoModel.from_pretrained("brain-bzh/reve-positions", trust_remote_code=True, dtype="auto")
+
+    if model_name == "labram":
+        # The montage (chs_info) and trial length are only known once the data
+        # loaders exist, so defer construction to the linear-probing runner.
+        # pos_bank is still used by the loaders' collate (LaBraM ignores pos).
+        return LabramSpec(NUM_CLASSES[dataset]), pos_bank
+
+    model = AutoModel.from_pretrained("brain-bzh/reve-base", trust_remote_code=True, dtype="auto")
 
     if pooling == "mean":
         class MeanPool(torch.nn.Module):
@@ -101,6 +113,12 @@ def build_model(dataset, load_final_layer=None, pooling="flatten"):
 def main():
     args = parse_args()
 
+    if args.model == "labram" and args.mode not in (
+        "linear", "joint", "joint_multilora", "joint_multilora_global"
+    ):
+        raise SystemExit("--model labram currently supports --mode linear, joint, "
+                          "joint_multilora and joint_multilora_global only")
+
     if args.seed is not None:
         set_seed(args.seed)
         torch.backends.cudnn.deterministic = True
@@ -108,7 +126,7 @@ def main():
     else:
         torch.backends.cudnn.benchmark = True
 
-    model, pos_bank = build_model(args.dataset, args.load_final_layer, args.pooling)
+    model, pos_bank = build_model(args.dataset, args.load_final_layer, args.pooling, args.model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     runners = {

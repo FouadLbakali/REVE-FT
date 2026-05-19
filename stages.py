@@ -21,6 +21,8 @@ from engine import (
     eval_head,
     eval_head_per_subject,
 )
+from labram_zoo import LabramSpec
+from labram_zoo import LORA_TARGET_MODULES as LABRAM_LORA_TARGET_MODULES
 from multilora import inject_multi_subject_lora
 from trainer import train_loop, print_metrics, make_scheduler, EarlyStopper
 
@@ -52,11 +54,20 @@ def _format_per_subject(per_subject):
     return block
 
 
-def make_lora_config(rank):
+# Per-backbone LoRA targets: attention (q/k/v + output proj) + the two FFN
+# linears of every transformer block. REVE: to_qkv/to_out + net.1/net.3;
+# LaBraM: qkv/proj + mlp.0/mlp.2 (see labram_zoo.LORA_TARGET_MODULES).
+_LORA_TARGETS = {
+    "reve": ["to_qkv", "to_out", "net.1", "net.3"],
+    "labram": LABRAM_LORA_TARGET_MODULES,
+}
+
+
+def make_lora_config(rank, model_name="reve"):
     return LoraConfig(
         r=rank,
         lora_alpha=32,
-        target_modules=["to_qkv", "to_out", "net.1", "net.3"], # attention + ffw
+        target_modules=_LORA_TARGETS[model_name],
         lora_dropout=0.05,
         bias="none",
         modules_to_save=["final_layer"],
@@ -177,7 +188,7 @@ def stage_global_lora(model, pooled_loaders, args, device, checkpoint, results=N
     print(f"{'=' * 60}")
 
     model.load_state_dict(checkpoint)
-    lora_model = get_peft_model(model, make_lora_config(args.gl_rank))
+    lora_model = get_peft_model(model, make_lora_config(args.gl_rank, args.model))
     lora_model.to(device)
     _print_trainable(lora_model)
 
@@ -221,7 +232,7 @@ def stage_per_subject_lora(model, subject_loaders, args, device, checkpoint, res
         print(f"  Trials — train: {len(subj_train.dataset)}, val: {len(subj_val.dataset)}, test: {len(subj_test.dataset)}")
 
         model.load_state_dict(checkpoint)
-        lora_model = get_peft_model(model, make_lora_config(args.lora_rank))
+        lora_model = get_peft_model(model, make_lora_config(args.lora_rank, args.model))
         lora_model.to(device)
 
         optimizer = torch.optim.AdamW(
@@ -270,12 +281,24 @@ def summarize_subject_results(subject_results, title):
 # Top-level run modes                                                          #
 # --------------------------------------------------------------------------- #
 
+def _materialize_labram(model, train_loader, ch_names):
+    """LaBraM is built lazily: its montage (chs_info) and trial length are only
+    known once the loaders exist. REVE is already an nn.Module -> passthrough."""
+    if isinstance(model, LabramSpec):
+        n_times = train_loader.dataset[0]["data"].shape[-1]
+        print(f"Building LaBraM ({len(ch_names)} ch, n_times={n_times})")
+        model = model.build(ch_names, n_times)
+    return model
+
+
 def run_linear_probing_cached(model, pos_bank, args, device, results=None):
     """Linear probing with feature caching: the backbone forward is run once per
     split, then only the head is trained."""
-    train_loader, val_loader, test_loader = load_loaders(
-        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
+    (train_loader, val_loader, test_loader), ch_names = load_loaders(
+        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
+        model_name=args.model,
     )
+    model = _materialize_labram(model, train_loader, ch_names)
     model.to(device)
 
     print("Extracting cached features (one-shot backbone forward)...")
@@ -339,7 +362,7 @@ def run_linear_probing_cached(model, pos_bank, args, device, results=None):
 
 
 def run_single_stage(model, pos_bank, args, device):
-    train_loader, val_loader, test_loader = load_loaders(
+    (train_loader, val_loader, test_loader), _ = load_loaders(
         args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
     )
 
@@ -371,8 +394,9 @@ def run_single_stage(model, pos_bank, args, device):
 
 
 def run_two_stage(model, pos_bank, args, device, results=None):
-    pooled_loaders, subject_loaders = load_loaders_per_subject(
-        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
+    pooled_loaders, subject_loaders, _ = load_loaders_per_subject(
+        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
+        model_name=args.model,
     )
     lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device, results=results)
     subject_results = stage_per_subject_lora(model, subject_loaders, args, device, lp_checkpoint, results=results)
@@ -380,8 +404,9 @@ def run_two_stage(model, pos_bank, args, device, results=None):
 
 
 def run_global_lora(model, pos_bank, args, device, results=None):
-    pooled_loaders, _ = load_loaders_per_subject(
-        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
+    pooled_loaders, _, _ = load_loaders_per_subject(
+        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
+        model_name=args.model,
     )
     lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device, results=results)
     stage_global_lora(model, pooled_loaders, args, device, lp_checkpoint, results=results)
@@ -392,9 +417,11 @@ def run_joint_lora(model, pos_bank, args, device, results=None):
     with no separate linear-probing phase. The head is trainable via the LoRA
     config's modules_to_save, so a single optimizer at args.lora_lr updates both
     the LoRA adapters and the head together."""
-    pooled_loaders, _ = load_loaders_per_subject(
-        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
+    pooled_loaders, _, ch_names = load_loaders_per_subject(
+        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
+        model_name=args.model,
     )
+    model = _materialize_labram(model, pooled_loaders[0], ch_names)
     print("=" * 60)
     print("  Joint training — head + Global LoRA (no separate LP phase)")
     print("=" * 60)
@@ -403,8 +430,9 @@ def run_joint_lora(model, pos_bank, args, device, results=None):
 
 
 def run_three_stage(model, pos_bank, args, device, results=None):
-    pooled_loaders, subject_loaders = load_loaders_per_subject(
-        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
+    pooled_loaders, subject_loaders, _ = load_loaders_per_subject(
+        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
+        model_name=args.model,
     )
     lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device, results=results)
     model, global_checkpoint = stage_global_lora(model, pooled_loaders, args, device, lp_checkpoint, results=results)
@@ -417,8 +445,9 @@ def run_joint_stacked(model, pos_bank, args, device, results=None):
     phase. The head is trained jointly with the Global LoRA in a single loop
     (head trainable via the LoRA config's modules_to_save), then per-subject
     LoRA is run on top of the merged backbone."""
-    pooled_loaders, subject_loaders = load_loaders_per_subject(
-        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
+    pooled_loaders, subject_loaders, _ = load_loaders_per_subject(
+        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
+        model_name=args.model,
     )
     print("=" * 60)
     print("  Joint training — head + Global LoRA (no separate LP phase)")
@@ -434,8 +463,9 @@ def run_joint_subject_specific(model, pos_bank, args, device, results=None):
     the head is trained jointly with the per-subject LoRA in a single loop (head
     trainable via the LoRA config's modules_to_save), seeded from a fresh
     checkpoint instead of an LP checkpoint."""
-    _, subject_loaders = load_loaders_per_subject(
-        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
+    _, subject_loaders, _ = load_loaders_per_subject(
+        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
+        model_name=args.model,
     )
     print("=" * 60)
     print("  Joint training — head + per-subject LoRA (no separate LP phase)")
@@ -464,10 +494,12 @@ def _run_joint_multilora(model, pos_bank, args, device, global_rank,
     forward + single backward updates the shared head and the adapters of the
     subjects present in the batch (no per-subject loop). With global_rank>0 a
     shared global LoRA adapter is trained jointly on top, in the same pass."""
-    pooled_loaders, subject_loaders = load_loaders_per_subject(
-        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects
+    pooled_loaders, subject_loaders, ch_names = load_loaders_per_subject(
+        args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
+        model_name=args.model,
     )
     pooled_train, pooled_val, pooled_test = pooled_loaders
+    model = _materialize_labram(model, pooled_train, ch_names)
     num_subjects = max(subject_loaders) + 1
 
     print("=" * 60)
@@ -477,6 +509,7 @@ def _run_joint_multilora(model, pos_bank, args, device, global_rank,
     model, n_targets = inject_multi_subject_lora(
         model, num_subjects, args.lora_rank, alpha=32, dropout=0.05,
         global_rank=global_rank, global_alpha=32,
+        target_suffixes=_LORA_TARGETS[args.model],
     )
     model.to(device)
     g = f", global rank={global_rank}" if global_rank else ""
