@@ -76,10 +76,12 @@ def _load_pp(model_name):
 
     The yaml mirrors the upstream LaBraM `data.neuro` schema; this maps it to
     the filter/resample/normalize settings the loaders consume. `scaler: null`
-    (LaBraM) means no scaler plus the fixed `scale_factor` (given in V units
-    while MOABB hands us microvolts, so it becomes scale_factor / 1e6) and a
-    trim to whole `frequency`-sample patches; `scaler: StandardScaler` (REVE)
-    means per-channel z-score on train stats.
+    (LaBraM / LUNA) means no per-channel z-score plus the fixed `scale_factor`
+    (given in V units while MOABB hands us microvolts, so it becomes
+    scale_factor / 1e6) and a trim to whole-patch trial lengths; `scaler:
+    StandardScaler` (REVE) means per-channel z-score on train stats. The
+    optional `patch_size` field controls the trim divisor (defaults to
+    `frequency`, i.e. one-second LaBraM patches); LUNA sets it to 40 samples.
     """
     with open(os.path.join(_MODELS_DIR, f"{model_name}.yaml")) as f:
         neuro = yaml.safe_load(f)["data"]["neuro"]
@@ -87,13 +89,18 @@ def _load_pp(model_name):
     notch = neuro["notch_filter"]
     freq = int(neuro["frequency"])
     is_labram = neuro["scaler"] is None
+    patch_size = neuro.get("patch_size")
+    if is_labram:
+        patch_trim = int(patch_size) if patch_size is not None else freq
+    else:
+        patch_trim = None
     return {
         "fmin": fmin,
         "fmax": fmax,
         "resample": freq,
-        "notch": notch[0] if notch else None,
+        "notch": list(notch) if notch else None,
         "normalize": "labram" if is_labram else "zscore",
-        "patch_trim": freq if is_labram else None,
+        "patch_trim": patch_trim,
         "scale": (neuro["scale_factor"] or 1e6) / 1e6,
     }
 
@@ -139,7 +146,9 @@ def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None,
     paradigm = MotorImagery(n_classes=4, resample=resample, fmin=fmin, fmax=fmax)
     bci_dataset = BNCI2014_001()
     subjects_arg = bci_dataset.subject_list[:num_subjects] if num_subjects is not None else None
-    X, y, metadata = paradigm.get_data(dataset=bci_dataset, subjects=subjects_arg)
+    epochs, y, metadata = paradigm.get_data(
+        dataset=bci_dataset, subjects=subjects_arg, return_epochs=True)
+    X = epochs.get_data(units="uV")
 
     if notch:
         X = _apply_notch(X, resample, notch)
@@ -180,7 +189,8 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None,
     positions = pos_bank(BCI_CHANNELS)
     paradigm = MotorImagery(n_classes=4, resample=resample, fmin=fmin, fmax=fmax)
     bci_dataset = BNCI2014_001()
-    X, y, metadata = paradigm.get_data(dataset=bci_dataset)
+    epochs, y, metadata = paradigm.get_data(dataset=bci_dataset, return_epochs=True)
+    X = epochs.get_data(units="uV")
 
     if notch:
         X = _apply_notch(X, resample, notch)
@@ -226,7 +236,8 @@ def _load_physionet_data(num_subjects, fmin=8.0, fmax=30.0):
     socket.setdefaulttimeout(300)
 
     paradigm = MotorImagery(
-        n_classes=4, resample=PHYSIONET_RESAMPLE, fmin=fmin, fmax=fmax
+        n_classes=4, resample=PHYSIONET_RESAMPLE, fmin=fmin, fmax=fmax,
+        tmin=0.0, tmax=4.0,
     )
     mi_dataset = PhysionetMI()
 
@@ -259,7 +270,8 @@ def _load_physionet_data(num_subjects, fmin=8.0, fmax=30.0):
 
     socket.setdefaulttimeout(prev_timeout)
 
-    # Truncate to clean multiple of PATCH_SIZE (PhysioNet trials are 601 samples @ 200 Hz)
+    # 4 s @ 200 Hz = 800 samples (MNE returns 801 with tmax inclusive); trim to
+    # an exact multiple of the LaBraM patch.
     n_samples = X.shape[-1]
     usable = (n_samples // PHYSIONET_PATCH_SIZE) * PHYSIONET_PATCH_SIZE
     X = X[:, :, :usable]
@@ -336,7 +348,8 @@ def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=
 
 
 def _load_zuo2025_data(num_subjects=None, resample=250, fmin=8.0, fmax=30.0):
-    paradigm = MotorImagery(n_classes=2, resample=resample, fmin=fmin, fmax=fmax)
+    paradigm = MotorImagery(n_classes=2, resample=resample, fmin=fmin, fmax=fmax,
+                            tmin=0.0, tmax=4.0)
     dataset = Zuo2025()
 
     subjects_list = dataset.subject_list
@@ -440,8 +453,10 @@ def load_loaders(dataset, pos_bank, batch_size, seed=None, num_subjects=109,
                  model_name="reve"):
     """Returns ((train, val, test), ch_names). Per-model input preprocessing
     is read from models/<model_name>.yaml (labram: 0.1-75 Hz, 50 Hz notch,
-    200 Hz, no scaler, uV->0.1 mV; reve: 8-30 Hz, z-scored)."""
-    pp = _load_pp("labram" if model_name == "labram" else "reve")
+    200 Hz, no scaler, uV->0.1 mV; luna: 0.1-75 Hz, 50 Hz notch, 256 Hz, raw
+    uV in (per-trial z-score happens inside the model); reve: 8-30 Hz,
+    z-scored on train stats)."""
+    pp = _load_pp(model_name if model_name in ("labram", "luna") else "reve")
     flt = {"fmin": pp["fmin"], "fmax": pp["fmax"], "notch": pp["notch"],
            "normalize": pp["normalize"], "scale": pp["scale"]}
     # PhysioNet is fixed at 200 Hz internally (PHYSIONET_RESAMPLE) and already
@@ -462,8 +477,9 @@ def load_loaders_per_subject(dataset, pos_bank, batch_size, seed=None,
     """Returns (pooled_loaders, subject_loaders, ch_names). Per-model input
     preprocessing is read from models/<model_name>.yaml, identically to
     load_loaders (labram: 0.1-75 Hz, 50 Hz notch, 200 Hz, no scaler,
-    uV->0.1 mV; reve: 8-30 Hz, z-scored)."""
-    pp = _load_pp("labram" if model_name == "labram" else "reve")
+    uV->0.1 mV; luna: 0.1-75 Hz, 50 Hz notch, 256 Hz, raw uV in (per-trial
+    z-score happens inside the model); reve: 8-30 Hz, z-scored)."""
+    pp = _load_pp(model_name if model_name in ("labram", "luna") else "reve")
     flt = {"fmin": pp["fmin"], "fmax": pp["fmax"], "notch": pp["notch"],
            "normalize": pp["normalize"], "scale": pp["scale"]}
     if dataset == "physionet":

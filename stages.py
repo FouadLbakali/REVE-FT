@@ -23,6 +23,8 @@ from engine import (
 )
 from labram_zoo import LabramSpec
 from labram_zoo import LORA_TARGET_MODULES as LABRAM_LORA_TARGET_MODULES
+from luna_zoo import LunaSpec
+from luna_zoo import LUNA_LORA_TARGET_MODULES
 from multilora import inject_multi_subject_lora
 from trainer import train_loop, print_metrics, make_scheduler, EarlyStopper
 
@@ -56,10 +58,12 @@ def _format_per_subject(per_subject):
 
 # Per-backbone LoRA targets: attention (q/k/v + output proj) + the two FFN
 # linears of every transformer block. REVE: to_qkv/to_out + net.1/net.3;
-# LaBraM: qkv/proj + mlp.0/mlp.2 (see labram_zoo.LORA_TARGET_MODULES).
+# LaBraM: qkv/proj + mlp.0/mlp.2; LUNA: qkv_proj/proj + fc1/fc2 (see the
+# *_zoo.py modules for details).
 _LORA_TARGETS = {
     "reve": ["to_qkv", "to_out", "net.1", "net.3"],
     "labram": LABRAM_LORA_TARGET_MODULES,
+    "luna": LUNA_LORA_TARGET_MODULES,
 }
 
 
@@ -193,7 +197,7 @@ def stage_global_lora(model, pooled_loaders, args, device, checkpoint, results=N
     _print_trainable(lora_model)
 
     optimizer = torch.optim.AdamW(
-        [p for p in lora_model.parameters() if p.requires_grad], lr=args.lora_lr
+        [p for p in lora_model.parameters() if p.requires_grad], lr=args.lr
     )
     best_state, history = train_loop(
         lora_model, pooled_train, pooled_val, optimizer, args.epochs, device,
@@ -236,7 +240,7 @@ def stage_per_subject_lora(model, subject_loaders, args, device, checkpoint, res
         lora_model.to(device)
 
         optimizer = torch.optim.AdamW(
-            [p for p in lora_model.parameters() if p.requires_grad], lr=args.lora_lr
+            [p for p in lora_model.parameters() if p.requires_grad], lr=args.lr
         )
         best_state, history = train_loop(
             lora_model, subj_train, subj_val, optimizer, args.epochs, device,
@@ -281,12 +285,13 @@ def summarize_subject_results(subject_results, title):
 # Top-level run modes                                                          #
 # --------------------------------------------------------------------------- #
 
-def _materialize_labram(model, train_loader, ch_names):
-    """LaBraM is built lazily: its montage (chs_info) and trial length are only
-    known once the loaders exist. REVE is already an nn.Module -> passthrough."""
-    if isinstance(model, LabramSpec):
+def _materialize_lazy(model, train_loader, ch_names):
+    """LaBraM and LUNA are built lazily: their montage (chs_info / channel
+    positions) and trial length are only known once the loaders exist. REVE is
+    already an nn.Module -> passthrough."""
+    if isinstance(model, (LabramSpec, LunaSpec)):
         n_times = train_loader.dataset[0]["data"].shape[-1]
-        print(f"Building LaBraM ({len(ch_names)} ch, n_times={n_times})")
+        print(f"Building {type(model).__name__} ({len(ch_names)} ch, n_times={n_times})")
         model = model.build(ch_names, n_times)
     return model
 
@@ -298,7 +303,7 @@ def run_linear_probing_cached(model, pos_bank, args, device, results=None):
         args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
         model_name=args.model,
     )
-    model = _materialize_labram(model, train_loader, ch_names)
+    model = _materialize_lazy(model, train_loader, ch_names)
     model.to(device)
 
     print("Extracting cached features (one-shot backbone forward)...")
@@ -415,13 +420,13 @@ def run_global_lora(model, pos_bank, args, device, results=None):
 def run_joint_lora(model, pos_bank, args, device, results=None):
     """Train the head (final_layer) and Global LoRA jointly in a single loop,
     with no separate linear-probing phase. The head is trainable via the LoRA
-    config's modules_to_save, so a single optimizer at args.lora_lr updates both
+    config's modules_to_save, so a single optimizer at args.lr updates both
     the LoRA adapters and the head together."""
     pooled_loaders, _, ch_names = load_loaders_per_subject(
         args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
         model_name=args.model,
     )
-    model = _materialize_labram(model, pooled_loaders[0], ch_names)
+    model = _materialize_lazy(model, pooled_loaders[0], ch_names)
     print("=" * 60)
     print("  Joint training — head + Global LoRA (no separate LP phase)")
     print("=" * 60)
@@ -499,7 +504,7 @@ def _run_joint_multilora(model, pos_bank, args, device, global_rank,
         model_name=args.model,
     )
     pooled_train, pooled_val, pooled_test = pooled_loaders
-    model = _materialize_labram(model, pooled_train, ch_names)
+    model = _materialize_lazy(model, pooled_train, ch_names)
     num_subjects = max(subject_loaders) + 1
 
     print("=" * 60)
@@ -518,9 +523,9 @@ def _run_joint_multilora(model, pos_bank, args, device, global_rank,
     _print_trainable(model)
 
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(params, lr=args.lora_lr)
+    optimizer = torch.optim.AdamW(params, lr=args.lr)
     scheduler = make_scheduler(optimizer, args.epochs, len(pooled_train),
-                               max_lr=args.lora_lr)
+                               max_lr=args.lr)
     stopper = EarlyStopper(args.patience)
 
     best_val = -float("inf")

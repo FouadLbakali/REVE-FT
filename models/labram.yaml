@@ -6,6 +6,7 @@ data:
       - 75.0
     notch_filter:
       - 50.0
+    baseline: null
     scaler: null
     scale_factor: 10000.0  # V -> 0.1 mV
     clamp: null

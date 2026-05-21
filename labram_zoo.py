@@ -159,7 +159,7 @@ def _load_pretrained(model):
 class LabramWrapper(nn.Module):
     """braindecode InterpolatedLaBraM behind the REVE-style training API."""
 
-    def __init__(self, ch_names, n_times, n_classes, dropout=0.1):
+    def __init__(self, ch_names, n_times, n_classes, dropout=0.1, pooling="flatten"):
         super().__init__()
         from braindecode.models import InterpolatedLaBraM
 
@@ -176,18 +176,50 @@ class LabramWrapper(nn.Module):
         print(f"Routed qkv through the module in {n_attn} attention blocks "
               f"(qkv LoRA-effective)")
 
-        # The wrapper owns the trainable head; the backbone returns pooled
-        # (B, embed_dim) features once its own head is the identity.
         embed_dim = self.backbone.embed_dim
+        self.pooling = pooling
         self.backbone.final_layer = nn.Identity()
-        self.final_layer = nn.Sequential(
-            nn.RMSNorm(embed_dim),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim, n_classes),
-        )
+
+        if pooling == "labram":
+            # Official LaBraM finetuning head: backbone's forward already does
+            # fc_norm(patch_tokens).mean(1) -> (B, embed_dim); just linear on top.
+            self.final_layer = nn.Linear(embed_dim, n_classes)
+        elif pooling == "mean":
+            # facebookresearch/neuroai (neuralbench) recipe: backbone is called
+            # with return_all_tokens=True -> fc_norm(full_seq) of shape
+            # (B, 1+n_tok, embed_dim); CLS + patch tokens are mean-pooled (so
+            # fc_norm is applied *before* the mean and CLS is included), then
+            # a single nn.Linear (`probe_config: linear`, no norm, no dropout).
+            self.final_layer = nn.Linear(embed_dim, n_classes)
+        elif pooling == "flatten":
+            # Flatten head matching REVE's `--pooling flatten`: skip the
+            # backbone's mean-pool, flatten the (B, n_canonical_chans *
+            # n_time_patches, embed_dim) patch tokens, then RMSNorm + Dropout +
+            # Linear.
+            n_canonical_chans = self.backbone.position_embedding.shape[1] - 1
+            n_time_patches = self.backbone.patch_embed[0].n_patchs
+            dim = n_canonical_chans * n_time_patches * embed_dim
+            self.final_layer = nn.Sequential(
+                nn.Flatten(),
+                nn.RMSNorm(dim),
+                nn.Dropout(dropout),
+                nn.Linear(dim, n_classes),
+            )
+        else:
+            raise ValueError(f"Unknown pooling {pooling!r} for LaBraM, "
+                             "expected 'flatten', 'mean' or 'labram'")
 
     def forward(self, data, pos=None):
-        feats = self.backbone(data)          # (B, embed_dim) pooled tokens
+        if self.pooling == "labram":
+            # (B, embed_dim) — backbone applies fc_norm + mean over patches.
+            feats = self.backbone(data)
+        elif self.pooling == "mean":
+            # (B, 1+n_tok, embed_dim) full sequence after fc_norm; mean over
+            # all tokens (CLS included) to match neuralbench's aggregation=mean.
+            feats = self.backbone(data, return_all_tokens=True).mean(dim=1)
+        else:
+            # (B, n_canonical_chans * n_time_patches, embed_dim) patch tokens
+            feats = self.backbone(data, return_patch_tokens=True)
         return self.final_layer(feats)
 
 
@@ -196,8 +228,9 @@ class LabramSpec:
     only known once the data loaders exist, so `build_model` returns this and
     the linear-probing runner materialises the model."""
 
-    def __init__(self, n_classes):
+    def __init__(self, n_classes, pooling="flatten"):
         self.n_classes = n_classes
+        self.pooling = pooling
 
     def build(self, ch_names, n_times):
-        return LabramWrapper(ch_names, n_times, self.n_classes)
+        return LabramWrapper(ch_names, n_times, self.n_classes, pooling=self.pooling)
