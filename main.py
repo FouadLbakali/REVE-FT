@@ -2,20 +2,21 @@ import argparse
 import json
 import os
 
-# Redirect MNE / MOABB caches away from $HOME (which is not writable here).
-_CACHE_ROOT = "/users/local/REVE-FT/.cache"
-os.makedirs(_CACHE_ROOT, exist_ok=True)
-os.makedirs(os.path.join(_CACHE_ROOT, "mne_data"), exist_ok=True)
-os.environ.setdefault("_MNE_FAKE_HOME_DIR", _CACHE_ROOT)
-os.environ.setdefault("MNE_DATA", os.path.join(_CACHE_ROOT, "mne_data"))
-os.environ.setdefault("MNE_DATASETS_BNCI_PATH", os.environ["MNE_DATA"])
-os.environ.setdefault("MOABB_RESULTS", os.path.join(_CACHE_ROOT, "moabb_results"))
-os.environ.setdefault("XDG_CACHE_HOME", _CACHE_ROOT)
+# # Redirect MNE / MOABB caches away from $HOME (which is not writable here).
+# _CACHE_ROOT = "/users/local/REVE-FT/.cache"
+# os.makedirs(_CACHE_ROOT, exist_ok=True)
+# os.makedirs(os.path.join(_CACHE_ROOT, "mne_data"), exist_ok=True)
+# os.environ.setdefault("_MNE_FAKE_HOME_DIR", _CACHE_ROOT)
+# os.environ.setdefault("MNE_DATA", os.path.join(_CACHE_ROOT, "mne_data"))
+# os.environ.setdefault("MNE_DATASETS_BNCI_PATH", os.environ["MNE_DATA"])
+# os.environ.setdefault("MOABB_RESULTS", os.path.join(_CACHE_ROOT, "moabb_results"))
+# os.environ.setdefault("XDG_CACHE_HOME", _CACHE_ROOT)
 
 import torch
 from transformers import AutoModel, set_seed
 
 from labram_zoo import LabramSpec
+from engine import set_bf16
 from stages import (
     run_global_lora,
     run_joint_lora,
@@ -66,6 +67,8 @@ def parse_args():
     parser.add_argument('--gl-rank', default=32, type=int, help='global LoRA rank')
     parser.add_argument('--results-out', default=None, type=str,
                         help='path to dump a JSON file with histories + test metrics + per-subject results')
+    parser.add_argument('--bf16', action='store_true',
+                        help='enable bfloat16 autocast (default: float32)')
     return parser.parse_args()
 
 def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="reve"):
@@ -112,6 +115,9 @@ def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="r
 
 def main():
     args = parse_args()
+
+    if args.bf16:
+        set_bf16(True)
 
     if args.model == "labram" and args.mode not in (
         "linear", "joint", "joint_multilora", "joint_multilora_global"

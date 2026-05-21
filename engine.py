@@ -7,6 +7,22 @@ from sklearn.metrics import balanced_accuracy_score, cohen_kappa_score, f1_score
 from sklearn.preprocessing import label_binarize
 
 
+_USE_BF16 = False
+
+
+def set_bf16(enabled: bool):
+    global _USE_BF16
+    _USE_BF16 = enabled
+
+
+def _autocast():
+    dtype = torch.bfloat16 if _USE_BF16 else torch.float32
+    return torch.amp.autocast(
+        dtype=dtype,
+        device_type="cuda" if torch.cuda.is_available() else "cpu",
+    )
+
+
 def _compute_metrics(y_targets, y_decisions, y_probs, n_classes=None, with_ranking=True):
     gt = torch.cat(y_targets).cpu().numpy()
     pr = torch.cat(y_decisions).cpu().numpy()
@@ -68,11 +84,12 @@ def train_one_epoch(model, optimizer, loader, device, use_subject_id=False, sche
             batch_data["pos"].to(device, non_blocking=True),
         )
         optimizer.zero_grad()
-        if use_subject_id:
-            subject_id = batch_data["subject_id"].to(device, non_blocking=True)
-            output = model(data, pos, subject_id)
-        else:
-            output = model(data, pos)
+        with _autocast():
+            if use_subject_id:
+                subject_id = batch_data["subject_id"].to(device, non_blocking=True)
+                output = model(data, pos, subject_id)
+            else:
+                output = model(data, pos)
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
@@ -100,11 +117,12 @@ def eval_model(model, loader, device, n_classes=None, use_subject_id=False):
                 batch_data["label"].to(device, non_blocking=True),
                 batch_data["pos"].to(device, non_blocking=True),
             )
-            if use_subject_id:
-                subject_id = batch_data["subject_id"].to(device, non_blocking=True)
-                output = model(data, pos, subject_id)
-            else:
-                output = model(data, pos)
+            with _autocast():
+                if use_subject_id:
+                    subject_id = batch_data["subject_id"].to(device, non_blocking=True)
+                    output = model(data, pos, subject_id)
+                else:
+                    output = model(data, pos)
 
             decisions = torch.argmax(output, dim=1)
             score += (decisions == target).int().sum().item()
@@ -132,11 +150,12 @@ def eval_model_per_subject(model, loader, device, n_classes=None, use_subject_id
             batch_data["label"].to(device, non_blocking=True),
             batch_data["pos"].to(device, non_blocking=True),
         )
-        if use_subject_id:
-            subject_id = batch_data["subject_id"].to(device, non_blocking=True)
-            output = model(data, pos, subject_id)
-        else:
-            output = model(data, pos)
+        with _autocast():
+            if use_subject_id:
+                subject_id = batch_data["subject_id"].to(device, non_blocking=True)
+                output = model(data, pos, subject_id)
+            else:
+                output = model(data, pos)
 
         y_decisions.append(torch.argmax(output, dim=1))
         y_targets.append(target)
@@ -173,7 +192,8 @@ def extract_features(model, loader, device, return_subjects=False):
     for batch_data in pbar:
         data = batch_data["sample"].to(device, non_blocking=True)
         pos = batch_data["pos"].to(device, non_blocking=True)
-        feats = model(data, pos)
+        with _autocast():
+            feats = model(data, pos)
         all_features.append(feats.float().cpu())
         all_labels.append(batch_data["label"].cpu())
         if return_subjects:
@@ -280,7 +300,8 @@ def train_one_epoch_multilora(model, optimizer, loader, device, scheduler=None):
         set_subject_ids(batch_data["subject_id"].to(device, non_blocking=True))
 
         optimizer.zero_grad()
-        output = model(data, pos)
+        with _autocast():
+            output = model(data, pos)
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
@@ -305,7 +326,8 @@ def eval_model_multilora(model, loader, device, n_classes=None):
         target = batch_data["label"].to(device, non_blocking=True)
         pos = batch_data["pos"].to(device, non_blocking=True)
         set_subject_ids(batch_data["subject_id"].to(device, non_blocking=True))
-        output = model(data, pos)
+        with _autocast():
+            output = model(data, pos)
         y_decisions.append(torch.argmax(output, dim=1))
         y_targets.append(target)
         y_probs.append(output)
@@ -325,7 +347,8 @@ def eval_model_multilora_per_subject(model, loader, device, n_classes=None):
         target = batch_data["label"].to(device, non_blocking=True)
         pos = batch_data["pos"].to(device, non_blocking=True)
         set_subject_ids(batch_data["subject_id"].to(device, non_blocking=True))
-        output = model(data, pos)
+        with _autocast():
+            output = model(data, pos)
         y_decisions.append(torch.argmax(output, dim=1))
         y_targets.append(target)
         y_probs.append(output)
