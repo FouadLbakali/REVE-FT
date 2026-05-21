@@ -16,6 +16,7 @@ import torch
 from transformers import AutoModel, set_seed
 
 from labram_zoo import LabramSpec
+from luna_zoo import LunaSpec
 from engine import set_bf16
 from stages import (
     run_global_lora,
@@ -40,27 +41,34 @@ def parse_args():
                         choices=["linear", "global", "joint", "stacked", "subject_specific",
                                  "joint_stacked", "joint_subject_specific", "joint_multilora",
                                  "joint_multilora_global"])
-    parser.add_argument('--model', default="reve", choices=["reve", "labram"],
-                        help='backbone: reve (brain-bzh/reve-base) or labram '
-                             '(braindecode/labram-pretrained); labram supports --mode '
-                             'linear, joint, joint_multilora and joint_multilora_global')
+    parser.add_argument('--model', default="reve", choices=["reve", "labram", "luna"],
+                        help='backbone: reve (brain-bzh/reve-base), labram '
+                             '(braindecode/labram-pretrained) or luna '
+                             '(PulpBio/LUNA, --luna-variant picks base/large/huge); '
+                             'labram and luna support --mode linear, joint, '
+                             'joint_multilora and joint_multilora_global')
+    parser.add_argument('--luna-variant', default="large",
+                        choices=["base", "large", "huge"],
+                        help='LUNA variant when --model luna')
     parser.add_argument('--pooling', default="flatten",
-                        choices=["flatten", "mean"])
+                        choices=["flatten", "mean", "labram"],
+                        help="'labram' is the official LaBraM classifier head "
+                             "(fc_norm + mean over patch tokens + linear) and "
+                             "is only valid with --model labram")
     parser.add_argument('--dataset', default="bciciv2a", choices=["bciciv2a", "physionet", "zuo2025"])
     parser.add_argument('--num-subjects', default=109, type=int, help='Number of subjects to load (PhysioNet max 109, bciciv2a max 9)')
     parser.add_argument('--epochs', default=25, type=int,
                         help='number of epochs (shared by every training stage: LP, GL, per-subject LoRA)')
     parser.add_argument('--patience', default=5, type=int,
                         help='early-stopping patience on val balanced_acc; <=0 disables early stopping')
-    parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
+    parser.add_argument('--lr', default=1e-4, type=float,
+                        help='learning rate (shared by LP head and LoRA stages)')
     parser.add_argument('--batch-size', default=32, type=int, help='batch size')
     parser.add_argument('--seed', default=42, type=int, help='seed')
     parser.add_argument('--save-final-layer', default=None, type=str, help='path to save the best final layer (linear mode)')
     parser.add_argument('--load-final-layer', default=None, type=str, help='path to load a pretrained final layer')
     parser.add_argument('--save-global-lora', default=None, type=str, help='directory to save Global LoRA adapters (PEFT save_pretrained)')
     parser.add_argument('--load-global-lora', default=None, type=str, help='directory to load Global LoRA adapters (skips LP and GL stages)')
-    # LoRA learning rate (shared by global and per-subject stages)
-    parser.add_argument('--lora-lr', default=1e-4, type=float, help='LoRA learning rate (global + per-subject)')
     # Per-subject LoRA
     parser.add_argument('--lora-rank', default=8, type=int, help='per-subject LoRA rank')
     # Global LoRA (for three_stage and global_lora modes)
@@ -71,14 +79,20 @@ def parse_args():
                         help='enable bfloat16 autocast (default: float32)')
     return parser.parse_args()
 
-def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="reve"):
+def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="reve",
+                luna_variant="large"):
     pos_bank = AutoModel.from_pretrained("brain-bzh/reve-positions", trust_remote_code=True, dtype="auto")
 
     if model_name == "labram":
         # The montage (chs_info) and trial length are only known once the data
         # loaders exist, so defer construction to the linear-probing runner.
         # pos_bank is still used by the loaders' collate (LaBraM ignores pos).
-        return LabramSpec(NUM_CLASSES[dataset]), pos_bank
+        return LabramSpec(NUM_CLASSES[dataset], pooling=pooling), pos_bank
+
+    if model_name == "luna":
+        # Same deferred-build story as LaBraM: ch_names (-> 3-D positions) and
+        # trial length are only known after the loaders are built.
+        return LunaSpec(NUM_CLASSES[dataset], variant=luna_variant), pos_bank
 
     model = AutoModel.from_pretrained("brain-bzh/reve-base", trust_remote_code=True, dtype="auto")
 
@@ -116,14 +130,14 @@ def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="r
 def main():
     args = parse_args()
 
-    if args.bf16:
-        set_bf16(True)
-
     if args.model == "labram" and args.mode not in (
         "linear", "joint", "joint_multilora", "joint_multilora_global"
     ):
-        raise SystemExit("--model labram currently supports --mode linear, joint, "
+        raise SystemExit(f"--model {args.model} currently supports --mode linear, joint, "
                           "joint_multilora and joint_multilora_global only")
+
+    if args.pooling == "labram" and args.model != "labram":
+        raise SystemExit("--pooling labram is only valid with --model labram")
 
     if args.seed is not None:
         set_seed(args.seed)
@@ -132,7 +146,8 @@ def main():
     else:
         torch.backends.cudnn.benchmark = True
 
-    model, pos_bank = build_model(args.dataset, args.load_final_layer, args.pooling, args.model)
+    model, pos_bank = build_model(args.dataset, args.load_final_layer, args.pooling,
+                                  args.model, luna_variant=args.luna_variant)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     runners = {
@@ -156,8 +171,8 @@ def main():
         "patience": args.patience,
         "hyperparams": {
             "lp": {"lr": args.lr},
-            "gl": {"lr": args.lora_lr, "rank": args.gl_rank},
-            "ft": {"lr": args.lora_lr, "rank": args.lora_rank},
+            "gl": {"lr": args.lr, "rank": args.gl_rank},
+            "ft": {"lr": args.lr, "rank": args.lora_rank},
         },
         "stages": {},
     }

@@ -1,0 +1,12 @@
+data:
+  neuro:
+    frequency: 256.0
+    filter:
+      - 0.1
+      - 75.0
+    notch_filter:
+      - 50.0
+    scaler: null
+    scale_factor: null          # raw uV in, per-trial channel-wise z-score in the model
+    clamp: null
+    patch_size: 40              # LUNA temporal patch (samples), used for trial-length trim
