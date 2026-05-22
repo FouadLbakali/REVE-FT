@@ -30,7 +30,7 @@ from stages import (
     run_two_stage,
 )
 
-TIME_PATCHES = {"bciciv2a": 5, "physionet": 3, "zuo2025": 5}
+TIME_PATCHES = {"bciciv2a": 5, "physionet": 4, "zuo2025": 5}
 NUM_CHANNELS = {"bciciv2a": 22, "physionet": 64, "zuo2025": 30}
 NUM_CLASSES = {"bciciv2a": 4, "physionet": 4, "zuo2025": 2}
 
@@ -44,12 +44,9 @@ def parse_args():
     parser.add_argument('--model', default="reve", choices=["reve", "labram", "luna"],
                         help='backbone: reve (brain-bzh/reve-base), labram '
                              '(braindecode/labram-pretrained) or luna '
-                             '(PulpBio/LUNA, --luna-variant picks base/large/huge); '
+                             '(PulpBio/LUNA); '
                              'labram and luna support --mode linear, joint, '
                              'joint_multilora and joint_multilora_global')
-    parser.add_argument('--luna-variant', default="large",
-                        choices=["base", "large", "huge"],
-                        help='LUNA variant when --model luna')
     parser.add_argument('--pooling', default="flatten",
                         choices=["flatten", "mean", "labram"],
                         help="'labram' is the official LaBraM classifier head "
@@ -79,8 +76,7 @@ def parse_args():
                         help='enable bfloat16 autocast (default: float32)')
     return parser.parse_args()
 
-def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="reve",
-                luna_variant="large"):
+def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="reve"):
     pos_bank = AutoModel.from_pretrained("brain-bzh/reve-positions", trust_remote_code=True, dtype="auto")
 
     if model_name == "labram":
@@ -92,7 +88,7 @@ def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="r
     if model_name == "luna":
         # Same deferred-build story as LaBraM: ch_names (-> 3-D positions) and
         # trial length are only known after the loaders are built.
-        return LunaSpec(NUM_CLASSES[dataset], variant=luna_variant), pos_bank
+        return LunaSpec(NUM_CLASSES[dataset]), pos_bank
 
     model = AutoModel.from_pretrained("brain-bzh/reve-base", trust_remote_code=True, dtype="auto")
 
@@ -130,6 +126,9 @@ def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="r
 def main():
     args = parse_args()
 
+    if args.bf16:
+        set_bf16(True)
+
     if args.model == "labram" and args.mode not in (
         "linear", "joint", "joint_multilora", "joint_multilora_global"
     ):
@@ -147,7 +146,7 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     model, pos_bank = build_model(args.dataset, args.load_final_layer, args.pooling,
-                                  args.model, luna_variant=args.luna_variant)
+                                  args.model)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     runners = {

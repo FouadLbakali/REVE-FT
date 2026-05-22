@@ -21,10 +21,6 @@ BCI_CHANNELS = ["Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
                  "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
                  "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz", "P2", "POz"]
 
-PHYSIONET_RESAMPLE = 200
-PHYSIONET_PATCH_SIZE = 200
-
-
 class BCIDataset(Dataset):
     def __init__(self, X, y, subject_ids):
         self.X = torch.tensor(X, dtype=torch.float32)
@@ -114,7 +110,9 @@ def _standardize_per_channel(X, train_indices):
 
 
 def _apply_notch(X, sfreq, freq):
-    """In-band line-noise notch (LaBraM keeps up to 75 Hz, so 50 Hz must go)."""
+    """In-band line-noise notch (LaBraM keeps up to 75 Hz, so 50 Hz must go).
+    IIR (+filtfilt zero-phase) because we filter post-epoching: trials are
+    ~4 s, too short for MNE's default FIR notch (~6 s kernel)."""
     from mne.filter import notch_filter
 
     return notch_filter(X.astype(np.float64), sfreq, freqs=freq,
@@ -229,15 +227,15 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None,
     return pooled_loaders, subject_loaders, BCI_CHANNELS
 
 
-def _load_physionet_data(num_subjects, fmin=8.0, fmax=30.0):
+def _load_physionet_data(num_subjects, resample=250, patch_trim=None,
+                         fmin=8.0, fmax=30.0):
     subjects_list = list(range(1, num_subjects + 1))
 
     prev_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(300)
 
     paradigm = MotorImagery(
-        n_classes=4, resample=PHYSIONET_RESAMPLE, fmin=fmin, fmax=fmax,
-        tmin=0.0, tmax=4.0,
+        n_classes=4, resample=resample, fmin=fmin, fmax=fmax,
     )
     mi_dataset = PhysionetMI()
 
@@ -249,7 +247,7 @@ def _load_physionet_data(num_subjects, fmin=8.0, fmax=30.0):
                 epochs_i, yi, mi = paradigm.get_data(dataset=mi_dataset, subjects=[subj], return_epochs=True)
                 if ch_names is None:
                     ch_names = epochs_i.ch_names
-                Xi = epochs_i.get_data(units="uV")
+                Xi = epochs_i.get_data(units="uV").astype(np.float32, copy=False)
                 all_X.append(Xi)
                 all_y.append(yi)
                 all_meta.append(mi)
@@ -270,11 +268,13 @@ def _load_physionet_data(num_subjects, fmin=8.0, fmax=30.0):
 
     socket.setdefaulttimeout(prev_timeout)
 
-    # 4 s @ 200 Hz = 800 samples (MNE returns 801 with tmax inclusive); trim to
-    # an exact multiple of the LaBraM patch.
-    n_samples = X.shape[-1]
-    usable = (n_samples // PHYSIONET_PATCH_SIZE) * PHYSIONET_PATCH_SIZE
-    X = X[:, :, :usable]
+    # For LaBraM-style models (patch_trim set), trim trial length to an exact
+    # multiple of the model's temporal patch. REVE (patch_trim=None) keeps the
+    # full trial.
+    if patch_trim is not None:
+        n_samples = X.shape[-1]
+        usable = (n_samples // patch_trim) * patch_trim
+        X = X[:, :, :usable]
 
     # PhysioNet's 4-class paradigm returns "rest" trials we must drop
     label_map = {"left_hand": 0, "right_hand": 1, "feet": 2, "hands": 3}
@@ -288,10 +288,13 @@ def _load_physionet_data(num_subjects, fmin=8.0, fmax=30.0):
 
 
 def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10,
+                      resample=250, patch_trim=None,
                       fmin=8.0, fmax=30.0, notch=None, normalize="zscore", scale=1.0):
-    X, y, metadata, ch_names = _load_physionet_data(num_subjects, fmin=fmin, fmax=fmax)
+    X, y, metadata, ch_names = _load_physionet_data(
+        num_subjects, resample=resample, patch_trim=patch_trim,
+        fmin=fmin, fmax=fmax)
     if notch:
-        X = _apply_notch(X, PHYSIONET_RESAMPLE, notch)
+        X = _apply_notch(X, resample, notch)
     positions = pos_bank(ch_names)
     subject_ids = metadata["subject"].values.astype(int) - 1
 
@@ -308,17 +311,18 @@ def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10,
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = torch.utils.data.DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
-    # PhysioNet is already 200 Hz, trimmed to a whole number of 200-sample
-    # patches (see _load_physionet_data), so it is LaBraM-ready as-is.
     return (train_loader, val_loader, test_loader), ch_names
 
 
 def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=10,
+                                  resample=250, patch_trim=None,
                                   fmin=8.0, fmax=30.0, notch=None,
                                   normalize="zscore", scale=1.0):
-    X, y, metadata, ch_names = _load_physionet_data(num_subjects, fmin=fmin, fmax=fmax)
+    X, y, metadata, ch_names = _load_physionet_data(
+        num_subjects, resample=resample, patch_trim=patch_trim,
+        fmin=fmin, fmax=fmax)
     if notch:
-        X = _apply_notch(X, PHYSIONET_RESAMPLE, notch)
+        X = _apply_notch(X, resample, notch)
     positions = pos_bank(ch_names)
     subjects_raw = metadata["subject"].values.astype(int)
     subject_ids = subjects_raw - 1
@@ -348,8 +352,7 @@ def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=
 
 
 def _load_zuo2025_data(num_subjects=None, resample=250, fmin=8.0, fmax=30.0):
-    paradigm = MotorImagery(n_classes=2, resample=resample, fmin=fmin, fmax=fmax,
-                            tmin=0.0, tmax=4.0)
+    paradigm = MotorImagery(n_classes=2, resample=resample, fmin=fmin, fmax=fmax)
     dataset = Zuo2025()
 
     subjects_list = dataset.subject_list
@@ -459,12 +462,12 @@ def load_loaders(dataset, pos_bank, batch_size, seed=None, num_subjects=109,
     pp = _load_pp(model_name if model_name in ("labram", "luna") else "reve")
     flt = {"fmin": pp["fmin"], "fmax": pp["fmax"], "notch": pp["notch"],
            "normalize": pp["normalize"], "scale": pp["scale"]}
-    # PhysioNet is fixed at 200 Hz internally (PHYSIONET_RESAMPLE) and already
-    # trimmed to whole 200-sample patches, so it takes no resample/patch_trim.
+    resample = pp.get("resample", 250)
     if dataset == "physionet":
         return load_physionet_mi(pos_bank, batch_size, seed=seed,
-                                 num_subjects=num_subjects, **flt)
-    resample = pp.get("resample", 250)
+                                 num_subjects=num_subjects,
+                                 resample=resample, patch_trim=pp["patch_trim"],
+                                 **flt)
     if dataset == "zuo2025":
         return load_zuo2025(pos_bank, batch_size, seed=seed, num_subjects=num_subjects,
                             resample=resample, patch_trim=pp["patch_trim"], **flt)
@@ -482,10 +485,11 @@ def load_loaders_per_subject(dataset, pos_bank, batch_size, seed=None,
     pp = _load_pp(model_name if model_name in ("labram", "luna") else "reve")
     flt = {"fmin": pp["fmin"], "fmax": pp["fmax"], "notch": pp["notch"],
            "normalize": pp["normalize"], "scale": pp["scale"]}
+    resample = pp.get("resample", 250)
     if dataset == "physionet":
         return load_physionet_mi_per_subject(
-            pos_bank, batch_size, seed=seed, num_subjects=num_subjects, **flt)
-    resample = pp.get("resample", 250)
+            pos_bank, batch_size, seed=seed, num_subjects=num_subjects,
+            resample=resample, patch_trim=pp["patch_trim"], **flt)
     if dataset == "zuo2025":
         return load_zuo2025_per_subject(
             pos_bank, batch_size, seed=seed, num_subjects=num_subjects,
