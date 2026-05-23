@@ -1,10 +1,13 @@
 import copy
+import os
 import sys
 import types
+from contextlib import contextmanager
 
 import numpy as np
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
+from peft.tuners.lora import LoraLayer
 
 sys.path.insert(0, "reve-repro-main/src")
 from models.lora import get_lora_config, CustomGetLora
@@ -25,7 +28,7 @@ from labram_zoo import LabramSpec
 from labram_zoo import LORA_TARGET_MODULES as LABRAM_LORA_TARGET_MODULES
 from luna_zoo import LunaSpec
 from luna_zoo import LUNA_LORA_TARGET_MODULES
-from multilora import inject_multi_subject_lora
+from multilora import inject_multi_subject_lora, merge_subject_lora
 from trainer import train_loop, print_metrics, make_scheduler, EarlyStopper
 
 
@@ -82,6 +85,35 @@ def _print_trainable(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.2f}%)")
+
+
+def save_all_joint(merged_model, save_dir, model_name):
+    """Persist a `joint`-mode run: the full merged model (backbone + Global LoRA
+    merged + head) as <save_dir>/<model_name>.pt."""
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, f"{model_name}.pt")
+    torch.save(merged_model.state_dict(), path)
+    print(f"Merged model saved to {path}")
+
+
+def save_all_multilora(model, subject_ids, save_dir, model_name):
+    """Persist a multi-LoRA run: one self-contained merged model per subject
+    (that subject's LoRA — and the global adapter, if any — folded into the
+    backbone, with the shared head) as <save_dir>/<model_name>_subject_<id>.pt.
+
+    `subject_ids` is the iterable of `subject_loaders` keys, i.e. the 1-based raw
+    subject ids (matching the per_subject ids in the results JSON). The matching
+    multi-LoRA adapter index is the 0-based `subject_id` used at routing time
+    (`raw - 1`), so adapter index = key - 1 and the file uses the 1-based key."""
+    os.makedirs(save_dir, exist_ok=True)
+    model = model.cpu()
+    subject_ids = sorted(subject_ids)
+    for raw_id in subject_ids:
+        merged = merge_subject_lora(model, raw_id - 1)
+        path = os.path.join(save_dir, f"{model_name}_subject_{raw_id:02d}.pt")
+        torch.save(merged.state_dict(), path)
+        del merged
+    print(f"Saved {len(subject_ids)} per-subject merged models under {save_dir}")
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +257,24 @@ def stage_global_lora(model, pooled_loaders, args, device, checkpoint, results=N
     return merged_model, copy.deepcopy(merged_model.state_dict())
 
 
+@contextmanager
+def _lora_disabled(peft_model):
+    """Disable only the LoRA adapter layers (their delta -> 0) while leaving the
+    modules_to_save head on its trained copy. Evaluating inside this context
+    isolates the LoRA's contribution: the gap vs the normal eval is exactly what
+    the adapters add on top of the (identically trained) head. Disabling at the
+    PeftModel level would also revert the head to its pre-train weights, which
+    would conflate the two."""
+    layers = [m for m in peft_model.modules() if isinstance(m, LoraLayer)]
+    for m in layers:
+        m.enable_adapters(False)
+    try:
+        yield
+    finally:
+        for m in layers:
+            m.enable_adapters(True)
+
+
 def stage_per_subject_lora(model, subject_loaders, args, device, checkpoint, results=None):
     subject_results = {}
     subjects_block = {} if results is not None else None
@@ -254,10 +304,19 @@ def stage_per_subject_lora(model, subject_loaders, args, device, checkpoint, res
         print(f"\n  --- Subject {subj} test results ---")
         print_metrics(test_metrics)
 
+        with _lora_disabled(lora_model):
+            test_metrics_ablated = eval_model(lora_model, subj_test, device)
+        lora_delta = test_metrics["balanced_acc"] - test_metrics_ablated["balanced_acc"]
+        print(f"\n  --- Subject {subj} LoRA-ablated (LoRA off, same head) ---")
+        print_metrics(test_metrics_ablated)
+        print(f"  LoRA contribution (balanced_acc): {lora_delta:+.4f}")
+
         if subjects_block is not None:
             subjects_block[str(subj)] = {
                 "history": history,
                 "test": _floatify(test_metrics),
+                "test_lora_ablated": _floatify(test_metrics_ablated),
+                "lora_delta_balanced_acc": float(lora_delta),
                 "n_trials": {"train": len(subj_train.dataset),
                              "val": len(subj_val.dataset),
                              "test": len(subj_test.dataset)},
@@ -399,10 +458,11 @@ def run_single_stage(model, pos_bank, args, device):
 
 
 def run_two_stage(model, pos_bank, args, device, results=None):
-    pooled_loaders, subject_loaders, _ = load_loaders_per_subject(
+    pooled_loaders, subject_loaders, ch_names = load_loaders_per_subject(
         args.dataset, pos_bank, args.batch_size, args.seed, args.num_subjects,
         model_name=args.model,
     )
+    model = _materialize_lazy(model, pooled_loaders[0], ch_names)
     lp_checkpoint = stage_linear_probing(model, pooled_loaders, args, device, results=results)
     subject_results = stage_per_subject_lora(model, subject_loaders, args, device, lp_checkpoint, results=results)
     summarize_subject_results(subject_results, "Two-Stage Fine-Tuning — Summary")
@@ -431,7 +491,12 @@ def run_joint_lora(model, pos_bank, args, device, results=None):
     print("  Joint training — head + Global LoRA (no separate LP phase)")
     print("=" * 60)
     fresh_checkpoint = copy.deepcopy(model.state_dict())
-    stage_global_lora(model, pooled_loaders, args, device, fresh_checkpoint, results=results)
+    merged_model, _ = stage_global_lora(
+        model, pooled_loaders, args, device, fresh_checkpoint, results=results
+    )
+
+    if getattr(args, "save_all", None):
+        save_all_joint(merged_model, args.save_all, args.model)
 
 
 def run_three_stage(model, pos_bank, args, device, results=None):
@@ -568,6 +633,9 @@ def _run_joint_multilora(model, pos_bank, args, device, global_rank,
         if global_rank:
             block["global_rank"] = int(global_rank)
         results.setdefault("stages", {})[results_key] = block
+
+    if getattr(args, "save_all", None):
+        save_all_multilora(model, subject_loaders.keys(), args.save_all, args.model)
 
 
 def run_joint_multilora(model, pos_bank, args, device, results=None):

@@ -41,7 +41,7 @@ def _make_pooled_subject_loaders(X, y, metadata, ch_names, pos_bank,
     n_test = n - n_train - n_val
     full_dataset, splits, gen = _data._split_dataset(
         X, y, subject_ids, n_train, n_val, n_test, seed,
-        normalize=pp["normalize"], scale=pp["scale"])
+        normalize=pp["normalize"], scale=pp["scale"], clamp=pp["clamp"])
     train_ds, val_ds, test_ds = splits
 
     pooled_loaders = (
@@ -85,6 +85,12 @@ def _load_raw(dataset, model_name, num_subjects):
             X = _data._apply_notch(X, resample, pp["notch"])
         if pp["patch_trim"]:
             X = X[:, :, : (X.shape[-1] // pp["patch_trim"]) * pp["patch_trim"]]
+    elif dataset == "physionet":
+        X, y, metadata, ch_names = _data._load_physionet_data(
+            num_subjects, resample=resample, patch_trim=pp["patch_trim"],
+            fmin=pp["fmin"], fmax=pp["fmax"])
+        if pp["notch"]:
+            X = _data._apply_notch(X, resample, pp["notch"])
     else:
         raise NotImplementedError(f"caching for dataset={dataset!r}")
 
@@ -112,12 +118,14 @@ import main as _main  # noqa: E402
 
 SEEDS = (42, 67, 1331)
 MODES = (
+    ("linear",                 "lp"),
     ("joint",                  "global"),
     ("joint_multilora",        "multi"),
     ("joint_multilora_global", "stacked"),
 )
-DATASETS = ("bciciv2a", "zuo2025")
-RESULTS_DIR = "results/new_labram"
+DATASETS = ("bciciv2a", "zuo2025", "physionet")
+RESULTS_DIR = "results/new_reve"
+NUM_SUBJECTS = 109
 
 
 def _build_combos():
@@ -140,11 +148,12 @@ def main():
         print("#" * 72, flush=True)
         sys.argv = [
             "main.py",
-            "--model", "labram",
+            "--model", "reve",
             "--bf16",
             "--seed", str(seed),
             "--mode", mode,
             "--dataset", dataset,
+            "--num-subjects", str(NUM_SUBJECTS),
             "--results-out", results_out,
         ]
         _main.main()

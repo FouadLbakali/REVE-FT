@@ -6,6 +6,7 @@ subject id, so one forward + one backward updates only the adapters of the
 subjects present in the batch -- no per-subject loop.
 """
 
+import copy
 import math
 
 import torch
@@ -117,3 +118,36 @@ def inject_multi_subject_lora(model, num_subjects, rank, alpha=32, dropout=0.05,
         p.requires_grad = True
 
     return model, len(targets)
+
+
+@torch.no_grad()
+def merge_subject_lora(model, subject_id):
+    """Return a deep copy of `model` where every MultiSubjectLoraLinear is
+    replaced by a plain nn.Linear whose weight folds in subject `subject_id`'s
+    adapter (plus the shared global adapter, if any).
+
+    The merge mirrors the layer's forward delta:
+        W_merged = W_base + scaling * (B_s @ A_s) [+ global_scaling * (Bg @ Ag)]
+    with A_s/B_s the subject's adapter and Bg/Ag the global adapter. The result
+    has the same module structure / state_dict keys as the original (unwrapped)
+    backbone, so it can be reloaded into a fresh backbone and run without any
+    subject-routing context."""
+    merged = copy.deepcopy(model).cpu()
+    for name, module in list(merged.named_modules()):
+        if not isinstance(module, MultiSubjectLoraLinear):
+            continue
+        base = module.base
+        weight = base.weight.data.clone()
+        A = module.lora_A[subject_id]                  # (r, in)
+        B = module.lora_B[subject_id]                  # (out, r)
+        weight = weight + module.scaling * (B @ A)
+        if module.global_rank > 0:
+            weight = weight + module.global_scaling * (module.global_B @ module.global_A)
+        linear = nn.Linear(base.in_features, base.out_features,
+                           bias=base.bias is not None)
+        linear.weight.data.copy_(weight)
+        if base.bias is not None:
+            linear.bias.data.copy_(base.bias.data)
+        parent = merged.get_submodule(name.rsplit(".", 1)[0]) if "." in name else merged
+        setattr(parent, name.rsplit(".", 1)[-1], linear)
+    return merged

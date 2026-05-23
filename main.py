@@ -30,7 +30,7 @@ from stages import (
     run_two_stage,
 )
 
-TIME_PATCHES = {"bciciv2a": 5, "physionet": 4, "zuo2025": 5}
+TIME_PATCHES = {"bciciv2a": 4, "physionet": 3, "zuo2025": 4}
 NUM_CHANNELS = {"bciciv2a": 22, "physionet": 64, "zuo2025": 30}
 NUM_CLASSES = {"bciciv2a": 4, "physionet": 4, "zuo2025": 2}
 
@@ -45,8 +45,10 @@ def parse_args():
                         help='backbone: reve (brain-bzh/reve-base), labram '
                              '(braindecode/labram-pretrained) or luna '
                              '(PulpBio/LUNA); '
-                             'labram and luna support --mode linear, joint, '
-                             'joint_multilora and joint_multilora_global')
+                             'labram supports --mode linear, joint, '
+                             'subject_specific, joint_multilora and '
+                             'joint_multilora_global; luna supports linear, '
+                             'joint, joint_multilora and joint_multilora_global')
     parser.add_argument('--pooling', default="flatten",
                         choices=["flatten", "mean", "labram"],
                         help="'labram' is the official LaBraM classifier head "
@@ -66,6 +68,13 @@ def parse_args():
     parser.add_argument('--load-final-layer', default=None, type=str, help='path to load a pretrained final layer')
     parser.add_argument('--save-global-lora', default=None, type=str, help='directory to save Global LoRA adapters (PEFT save_pretrained)')
     parser.add_argument('--load-global-lora', default=None, type=str, help='directory to load Global LoRA adapters (skips LP and GL stages)')
+    parser.add_argument('--save-all', default=None, type=str,
+                        help='directory to save the full merged model (backbone + LoRA '
+                             'merged + head). For joint: writes <model>.pt. For '
+                             'joint_multilora and joint_multilora_global: writes one '
+                             '<model>_subject_<id>.pt per subject (subject-specific LoRA '
+                             'merged in). Only valid with --mode joint, joint_multilora '
+                             'or joint_multilora_global')
     # Per-subject LoRA
     parser.add_argument('--lora-rank', default=8, type=int, help='per-subject LoRA rank')
     # Global LoRA (for three_stage and global_lora modes)
@@ -130,13 +139,19 @@ def main():
         set_bf16(True)
 
     if args.model == "labram" and args.mode not in (
-        "linear", "joint", "joint_multilora", "joint_multilora_global"
+        "linear", "joint", "subject_specific", "joint_multilora", "joint_multilora_global"
     ):
         raise SystemExit(f"--model {args.model} currently supports --mode linear, joint, "
-                          "joint_multilora and joint_multilora_global only")
+                          "subject_specific, joint_multilora and joint_multilora_global only")
 
     if args.pooling == "labram" and args.model != "labram":
         raise SystemExit("--pooling labram is only valid with --model labram")
+
+    if args.save_all and args.mode not in (
+        "joint", "joint_multilora", "joint_multilora_global"
+    ):
+        raise SystemExit("--save-all is only valid with --mode joint, joint_multilora "
+                          "or joint_multilora_global")
 
     if args.seed is not None:
         set_seed(args.seed)

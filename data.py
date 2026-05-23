@@ -98,6 +98,7 @@ def _load_pp(model_name):
         "normalize": "labram" if is_labram else "zscore",
         "patch_trim": patch_trim,
         "scale": (neuro["scale_factor"] or 1e6) / 1e6,
+        "clamp": neuro.get("clamp"),
     }
 
 
@@ -120,7 +121,7 @@ def _apply_notch(X, sfreq, freq):
 
 
 def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed,
-                   normalize="zscore", scale=1.0):
+                   normalize="zscore", scale=1.0, clamp=None):
     """Split indices, normalize, then build the dataset. `normalize="zscore"`
     (REVE, default) z-scores per channel on train stats; `"labram"` applies no
     scaler and the fixed uV-input `scale` (see models/labram.yaml)."""
@@ -131,6 +132,8 @@ def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed,
         X = X * scale
     else:
         X = _standardize_per_channel(X, train_idx.indices)
+    if clamp is not None:
+        X = np.clip(X, -clamp, clamp)
     full_dataset = BCIDataset(X, y, subject_ids)
     splits = tuple(torch.utils.data.Subset(full_dataset, s.indices)
                    for s in (train_idx, val_idx, test_idx))
@@ -139,7 +142,7 @@ def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed,
 
 def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None,
                   resample=250, patch_trim=None, fmin=8.0, fmax=30.0,
-                  notch=None, normalize="zscore", scale=1.0):
+                  notch=None, normalize="zscore", scale=1.0, clamp=None):
     positions = pos_bank(BCI_CHANNELS)
     paradigm = MotorImagery(n_classes=4, resample=resample, fmin=fmin, fmax=fmax)
     bci_dataset = BNCI2014_001()
@@ -163,7 +166,7 @@ def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None,
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
     _, (train_ds, val_ds, test_ds), gen = _split_dataset(
-        X, y, subjects, n_train, n_val, n_test, seed, normalize=normalize, scale=scale)
+        X, y, subjects, n_train, n_val, n_test, seed, normalize=normalize, scale=scale, clamp=clamp)
 
     collate_fn = partial(collate, positions=positions)
 
@@ -176,7 +179,7 @@ def load_bciciv2a(pos_bank, batch_size, seed=None, num_subjects=None,
 
 def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None,
                               resample=250, patch_trim=None, fmin=8.0, fmax=30.0,
-                              notch=None, normalize="zscore", scale=1.0):
+                              notch=None, normalize="zscore", scale=1.0, clamp=None):
     """Return per-subject data loaders for two-stage fine-tuning.
 
     Returns:
@@ -210,7 +213,7 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None,
     n_test = n - n_train - n_val
     full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(
         X, y, subject_ids, n_train, n_val, n_test, seed,
-        normalize=normalize, scale=scale)
+        normalize=normalize, scale=scale, clamp=clamp)
 
     pooled_loaders = (
         torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
@@ -230,6 +233,19 @@ def load_bciciv2a_per_subject(pos_bank, batch_size, seed=None,
 def _load_physionet_data(num_subjects, resample=250, patch_trim=None,
                          fmin=8.0, fmax=30.0):
     subjects_list = list(range(1, num_subjects + 1))
+
+    # MOABB applies the bandpass at the recording's native rate, before
+    # resampling. PhysioNet records at 160 Hz (Nyquist 80), so an upper edge at
+    # or above 80 Hz fails. REVE's broadband 99.5 Hz edge is valid at its 200 Hz
+    # target but unattainable on 160 Hz data (content above 80 Hz cannot exist).
+    # Mirror neuralbench's MneRaw extractor: when the low-pass cutoff reaches the
+    # native Nyquist, drop it (high-pass only) instead of erroring.
+    physionet_nyquist = 160.0 / 2.0
+    if fmax is not None and fmax >= physionet_nyquist:
+        print(f"  PhysioNet: low-pass fmax {fmax} >= native Nyquist "
+              f"{physionet_nyquist} Hz; dropping it (high-pass only), "
+              f"matching neuralbench's MneRaw.")
+        fmax = None
 
     prev_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(300)
@@ -254,11 +270,24 @@ def _load_physionet_data(num_subjects, resample=250, patch_trim=None,
                 print(f"  Subject {subj}: {len(yi)} trials")
                 break
             except Exception as e:
+                # PhysioNet subjects 88/89/92/100 are recorded at 128 Hz
+                # (Nyquist 64) instead of the usual 160 Hz, so a bandpass with
+                # fmax >= 64 (e.g. labram's 75 Hz) fails before resampling.
+                # This is deterministic, so skip the subject instead of
+                # retrying and crashing the whole run.
+                if "Nyquist" in str(e):
+                    print(f"  Subject {subj} skipped (filter exceeds Nyquist): {e}")
+                    break
                 print(f"  Subject {subj} attempt {attempt+1} failed: {e}")
                 if attempt < 2:
                     time.sleep(5)
                 else:
                     raise
+
+    if not all_X:
+        raise RuntimeError(
+            f"No PhysioNet subjects loaded (all of {subjects_list} skipped). "
+            f"Check the bandpass fmax against the recordings' native Nyquist.")
 
     min_len = min(Xi.shape[-1] for Xi in all_X)
     all_X = [Xi[:, :, :min_len] for Xi in all_X]
@@ -289,7 +318,7 @@ def _load_physionet_data(num_subjects, resample=250, patch_trim=None,
 
 def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10,
                       resample=250, patch_trim=None,
-                      fmin=8.0, fmax=30.0, notch=None, normalize="zscore", scale=1.0):
+                      fmin=8.0, fmax=30.0, notch=None, normalize="zscore", scale=1.0, clamp=None):
     X, y, metadata, ch_names = _load_physionet_data(
         num_subjects, resample=resample, patch_trim=patch_trim,
         fmin=fmin, fmax=fmax)
@@ -303,7 +332,7 @@ def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10,
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
     _, (train_ds, val_ds, test_ds), gen = _split_dataset(
-        X, y, subject_ids, n_train, n_val, n_test, seed, normalize=normalize, scale=scale)
+        X, y, subject_ids, n_train, n_val, n_test, seed, normalize=normalize, scale=scale, clamp=clamp)
 
     collate_fn = partial(collate, positions=positions)
 
@@ -317,7 +346,7 @@ def load_physionet_mi(pos_bank, batch_size, seed=None, num_subjects=10,
 def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=10,
                                   resample=250, patch_trim=None,
                                   fmin=8.0, fmax=30.0, notch=None,
-                                  normalize="zscore", scale=1.0):
+                                  normalize="zscore", scale=1.0, clamp=None):
     X, y, metadata, ch_names = _load_physionet_data(
         num_subjects, resample=resample, patch_trim=patch_trim,
         fmin=fmin, fmax=fmax)
@@ -335,7 +364,7 @@ def load_physionet_mi_per_subject(pos_bank, batch_size, seed=None, num_subjects=
     n_test = n - n_train - n_val
     full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(
         X, y, subject_ids, n_train, n_val, n_test, seed,
-        normalize=normalize, scale=scale)
+        normalize=normalize, scale=scale, clamp=clamp)
 
     pooled_loaders = (
         torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
@@ -389,7 +418,7 @@ def _load_zuo2025_data(num_subjects=None, resample=250, fmin=8.0, fmax=30.0):
 
 def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None,
                  resample=250, patch_trim=None, fmin=8.0, fmax=30.0,
-                 notch=None, normalize="zscore", scale=1.0):
+                 notch=None, normalize="zscore", scale=1.0, clamp=None):
     X, y, metadata, ch_names = _load_zuo2025_data(
         num_subjects, resample=resample, fmin=fmin, fmax=fmax)
     if notch:
@@ -404,7 +433,7 @@ def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None,
     n_val = int(0.15 * n)
     n_test = n - n_train - n_val
     _, (train_ds, val_ds, test_ds), gen = _split_dataset(
-        X, y, subject_ids, n_train, n_val, n_test, seed, normalize=normalize, scale=scale)
+        X, y, subject_ids, n_train, n_val, n_test, seed, normalize=normalize, scale=scale, clamp=clamp)
 
     collate_fn = partial(collate, positions=positions)
 
@@ -417,7 +446,7 @@ def load_zuo2025(pos_bank, batch_size, seed=None, num_subjects=None,
 
 def load_zuo2025_per_subject(pos_bank, batch_size, seed=None, num_subjects=None,
                              resample=250, patch_trim=None, fmin=8.0, fmax=30.0,
-                             notch=None, normalize="zscore", scale=1.0):
+                             notch=None, normalize="zscore", scale=1.0, clamp=None):
     X, y, metadata, ch_names = _load_zuo2025_data(
         num_subjects, resample=resample, fmin=fmin, fmax=fmax)
     if notch:
@@ -436,7 +465,7 @@ def load_zuo2025_per_subject(pos_bank, batch_size, seed=None, num_subjects=None,
     n_test = n - n_train - n_val
     full_dataset, (train_ds, val_ds, test_ds), gen = _split_dataset(
         X, y, subject_ids, n_train, n_val, n_test, seed,
-        normalize=normalize, scale=scale)
+        normalize=normalize, scale=scale, clamp=clamp)
 
     pooled_loaders = (
         torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, generator=gen),
@@ -461,7 +490,8 @@ def load_loaders(dataset, pos_bank, batch_size, seed=None, num_subjects=109,
     z-scored on train stats)."""
     pp = _load_pp(model_name if model_name in ("labram", "luna") else "reve")
     flt = {"fmin": pp["fmin"], "fmax": pp["fmax"], "notch": pp["notch"],
-           "normalize": pp["normalize"], "scale": pp["scale"]}
+           "normalize": pp["normalize"], "scale": pp["scale"],
+           "clamp": pp["clamp"]}
     resample = pp.get("resample", 250)
     if dataset == "physionet":
         return load_physionet_mi(pos_bank, batch_size, seed=seed,
@@ -484,7 +514,8 @@ def load_loaders_per_subject(dataset, pos_bank, batch_size, seed=None,
     z-score happens inside the model); reve: 8-30 Hz, z-scored)."""
     pp = _load_pp(model_name if model_name in ("labram", "luna") else "reve")
     flt = {"fmin": pp["fmin"], "fmax": pp["fmax"], "notch": pp["notch"],
-           "normalize": pp["normalize"], "scale": pp["scale"]}
+           "normalize": pp["normalize"], "scale": pp["scale"],
+           "clamp": pp["clamp"]}
     resample = pp.get("resample", 250)
     if dataset == "physionet":
         return load_physionet_mi_per_subject(
