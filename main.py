@@ -50,10 +50,12 @@ def parse_args():
                              'joint_multilora_global; luna supports linear, '
                              'joint, joint_multilora and joint_multilora_global')
     parser.add_argument('--pooling', default="flatten",
-                        choices=["flatten", "mean", "labram"],
+                        choices=["flatten", "mean", "labram", "luna"],
                         help="'labram' is the official LaBraM classifier head "
                              "(fc_norm + mean over patch tokens + linear) and "
-                             "is only valid with --model labram")
+                             "is only valid with --model labram; 'luna' is the "
+                             "official LUNA attention-pooling head and is only "
+                             "valid with --model luna")
     parser.add_argument('--dataset', default="bciciv2a", choices=["bciciv2a", "physionet", "zuo2025"])
     parser.add_argument('--num-subjects', default=109, type=int, help='Number of subjects to load (PhysioNet max 109, bciciv2a max 9)')
     parser.add_argument('--epochs', default=25, type=int,
@@ -97,7 +99,7 @@ def build_model(dataset, load_final_layer=None, pooling="flatten", model_name="r
     if model_name == "luna":
         # Same deferred-build story as LaBraM: ch_names (-> 3-D positions) and
         # trial length are only known after the loaders are built.
-        return LunaSpec(NUM_CLASSES[dataset]), pos_bank
+        return LunaSpec(NUM_CLASSES[dataset], pooling=pooling), pos_bank
 
     model = AutoModel.from_pretrained("brain-bzh/reve-base", trust_remote_code=True, dtype="auto")
 
@@ -146,6 +148,12 @@ def main():
 
     if args.pooling == "labram" and args.model != "labram":
         raise SystemExit("--pooling labram is only valid with --model labram")
+
+    if args.pooling == "luna" and args.model != "luna":
+        raise SystemExit("--pooling luna is only valid with --model luna")
+
+    if args.model == "luna" and args.pooling not in ("flatten", "luna"):
+        raise SystemExit("--model luna supports --pooling flatten or luna only")
 
     if args.save_all and args.mode not in (
         "joint", "joint_multilora", "joint_multilora_global"

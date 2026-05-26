@@ -6,6 +6,7 @@ data:
       - 75.0
     notch_filter:
       - 50.0
+      - 60.0
     scaler: null
     scale_factor: null          # raw uV in, per-trial channel-wise z-score in the model
     clamp: null

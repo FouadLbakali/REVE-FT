@@ -116,8 +116,10 @@ def _apply_notch(X, sfreq, freq):
     ~4 s, too short for MNE's default FIR notch (~6 s kernel)."""
     from mne.filter import notch_filter
 
-    return notch_filter(X.astype(np.float64), sfreq, freqs=freq,
-                        method="iir", verbose=False)
+    X = X.astype(np.float64)
+    for f in np.atleast_1d(freq):
+        X = notch_filter(X, sfreq, freqs=f, method="iir", verbose=False)
+    return X
 
 
 def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed,

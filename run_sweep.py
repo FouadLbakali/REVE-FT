@@ -123,8 +123,9 @@ MODES = (
     ("joint_multilora",        "multi"),
     ("joint_multilora_global", "stacked"),
 )
-DATASETS = ("bciciv2a", "zuo2025", "physionet")
-RESULTS_DIR = "results/new_reve"
+DATASETS = ("physionet",)
+MODEL = "luna"
+RESULTS_DIR = f"results/new_{MODEL}"
 NUM_SUBJECTS = 109
 
 
@@ -148,7 +149,7 @@ def main():
         print("#" * 72, flush=True)
         sys.argv = [
             "main.py",
-            "--model", "reve",
+            "--model", MODEL,
             "--bf16",
             "--seed", str(seed),
             "--mode", mode,
