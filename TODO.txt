@@ -4,8 +4,6 @@ Observer le compute apporté en utilisant lora
 Etudier le few shot
 Etudier le rang LoRA vs le nombre de sujet
 
-Explorer la piste sur le mecanisme du CLS token
-
 Dataset non inclus dans le pretraining :
     PhysioNet-MI
     BCIC-IV-2a
@@ -17,3 +15,4 @@ Dataset non inclus dans le pretraining :
     Mumtaz
     MAT
     BCI2020-IV-3
+

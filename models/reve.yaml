@@ -1,0 +1,10 @@
+data:
+  neuro:
+    frequency: 200.0
+    filter:
+      - 0.5
+      - 99.5
+    notch_filter: null
+    scaler: StandardScaler
+    scale_factor: null
+    clamp: 15
