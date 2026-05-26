@@ -119,7 +119,10 @@ def _apply_notch(X, sfreq, freq):
     X = X.astype(np.float64)
     for f in np.atleast_1d(freq):
         X = notch_filter(X, sfreq, freqs=f, method="iir", verbose=False)
-    return X
+    # Filter in float64 for filtfilt stability, but hand back float32: every
+    # consumer ends up in BCIDataset (float32), and keeping the cached array
+    # float64 doubles its RAM footprint.
+    return X.astype(np.float32)
 
 
 def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed,
@@ -131,7 +134,8 @@ def _split_dataset(X, y, subject_ids, n_train, n_val, n_test, seed,
     n = n_train + n_val + n_test
     train_idx, val_idx, test_idx = random_split(range(n), [n_train, n_val, n_test], generator=gen)
     if normalize == "labram":
-        X = X * scale
+        if scale != 1.0:  # scale==1.0 (luna): skip the full-array copy
+            X = X * scale
     else:
         X = _standardize_per_channel(X, train_idx.indices)
     if clamp is not None:
