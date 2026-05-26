@@ -1,1 +1,13 @@
 __pycache__
+.claude
+logs
+sweep_logs
+*.pt
+CLAUDE.md
+*.sh
+results/
+mne_data/
+ckpts/
+.cache/
+figures
+.pytest_cache
