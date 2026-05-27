@@ -55,4 +55,7 @@ tests/                # offline correctness tests (no downloads required)
 
 - `scripts/run_all.py` — the script used to obtain all the results from the paper.
 - `scripts/plot_subjects_bciciv2a.py` — per-subject result figures for BCIC IV-2a.
+- `scripts/ablation_lora_rank.py` — LoRA-rank ablation for REVE on BCIC IV-2a:
+  per-step training-loss curves, one line per rank, for `--gl-rank` (global mode)
+  and `--lora-rank` (subject-specific mode). Trains + plots a 2-panel figure.
 - `scripts/umap_class_x_strategy.py`
