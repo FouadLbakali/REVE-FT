@@ -9,3 +9,10 @@ data:
     scaler: null
     scale_factor: 10000.0  # V -> 0.1 mV
     clamp: null
+lora:
+  # Attention (qkv / out proj) + MLP (fc1 / fc2) inside every transformer block.
+  target_modules:
+    - qkv
+    - proj
+    - mlp.0
+    - mlp.2

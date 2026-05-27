@@ -1,0 +1,16 @@
+# Per-dataset shape properties used to build the classifier head.
+# time_patches: number of time patches produced by the backbone
+# num_channels: number of EEG channels
+# num_classes: number of target classes
+bciciv2a:
+  time_patches: 4
+  num_channels: 22
+  num_classes: 4
+physionet:
+  time_patches: 3
+  num_channels: 64
+  num_classes: 4
+zuo2025:
+  time_patches: 4
+  num_channels: 30
+  num_classes: 2

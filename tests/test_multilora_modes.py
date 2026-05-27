@@ -1,5 +1,5 @@
-"""End-to-end correctness tests for the joint_multilora and
-joint_multilora_global modes, parametrized over the reve and labram backbones.
+"""End-to-end correctness tests for the subject-specific and stacked modes,
+parametrized over the reve and labram backbones.
 
 Each test runs twice: once with a REVE-shaped fake backbone (to_qkv / to_out /
 net.1 / net.3) and once with a LaBraM-shaped fake backbone (qkv / proj /
@@ -14,7 +14,7 @@ Verified:
   - backbone params stay frozen across training,
   - per-subject LoRA params move only for subjects present in the batches,
   - the shared head moves,
-  - global LoRA params move in the `_global` mode (and don't exist otherwise),
+  - global LoRA params move in the stacked mode (and don't exist otherwise),
   - the `_load_trainable_state` round-trip preserves the best val checkpoint,
   - the results dict has the expected per-stage block,
   - per-subject test metrics are emitted with 1-based ids,
@@ -22,7 +22,7 @@ Verified:
   - a tiny overfittable task drives the train accuracy above chance.
 
 Runs fully offline (no model / dataset download).
-Run:  uv run python tests/test_joint_multilora_modes.py
+Run:  uv run python tests/test_multilora_modes.py
 """
 import os
 import sys
@@ -229,10 +229,6 @@ def _default_args(model="reve", **overrides):
         lr=1e-3,
         lora_rank=4,
         gl_rank=4,
-        load_final_layer=None,
-        load_global_lora=None,
-        save_final_layer=None,
-        save_global_lora=None,
         bf16=False,
     )
     for k, v in overrides.items():
@@ -247,7 +243,7 @@ def test_lora_bank_size_matches_num_subjects(make_model, model_name):
     _patch_loaders()
     args = _default_args(model=model_name)
     model = make_model()
-    stages.run_joint_multilora(model, pos_bank=None, args=args,
+    stages.run_subject_specific(model, pos_bank=None, args=args,
                                device=torch.device("cpu"), results={})
     banks = [m for m in model.modules() if isinstance(m, MultiSubjectLoraLinear)]
     assert banks, "no MultiSubjectLoraLinear found after run"
@@ -265,7 +261,7 @@ def test_backbone_frozen_head_and_lora_move(make_model, model_name):
     model = make_model()
     head_before = {n: p.detach().clone()
                    for n, p in model.final_layer.named_parameters()}
-    stages.run_joint_multilora(model, pos_bank=None, args=args,
+    stages.run_subject_specific(model, pos_bank=None, args=args,
                                device=torch.device("cpu"), results={})
 
     # Backbone (base.* of every wrapped Linear) stays requires_grad=False.
@@ -315,7 +311,7 @@ def test_only_present_subjects_receive_lora_updates(make_model, model_name):
     stages.load_loaders_per_subject = _fake
     args = _default_args(model=model_name)
     model = make_model()
-    stages.run_joint_multilora(model, pos_bank=None, args=args,
+    stages.run_subject_specific(model, pos_bank=None, args=args,
                                device=torch.device("cpu"), results={})
 
     for m in model.modules():
@@ -329,29 +325,29 @@ def test_only_present_subjects_receive_lora_updates(make_model, model_name):
             assert present_moved, "no present subject's lora_B moved"
 
 
-def test_global_mode_trains_global_adapter(make_model, model_name):
+def test_stacked_trains_global_adapter(make_model, model_name):
     _patch_loaders()
     args = _default_args(model=model_name)
     model = make_model()
-    stages.run_joint_multilora_global(model, pos_bank=None, args=args,
+    stages.run_stacked(model, pos_bank=None, args=args,
                                       device=torch.device("cpu"), results={})
 
     has_global = False
     for m in model.modules():
         if isinstance(m, MultiSubjectLoraLinear):
             assert hasattr(m, "global_A") and hasattr(m, "global_B"), \
-                "global adapter missing in joint_multilora_global"
+                "global adapter missing in stacked mode"
             assert m.global_rank == args.gl_rank
             if m.global_B.detach().abs().sum().item() > 0:
                 has_global = True
-    assert has_global, "no global_B moved away from zero in _global mode"
+    assert has_global, "no global_B moved away from zero in stacked mode"
 
 
-def test_non_global_mode_has_no_global_adapter(make_model, model_name):
+def test_non_stacked_has_no_global_adapter(make_model, model_name):
     _patch_loaders()
     args = _default_args(model=model_name)
     model = make_model()
-    stages.run_joint_multilora(model, pos_bank=None, args=args,
+    stages.run_subject_specific(model, pos_bank=None, args=args,
                                device=torch.device("cpu"), results={})
     for m in model.modules():
         if isinstance(m, MultiSubjectLoraLinear):
@@ -364,11 +360,11 @@ def test_results_block_structure(make_model, model_name):
     _patch_loaders()
     args = _default_args(model=model_name)
     results = {}
-    stages.run_joint_multilora(make_model(), None, args, torch.device("cpu"),
+    stages.run_subject_specific(make_model(), None, args, torch.device("cpu"),
                                results=results)
     block = results["stages"]["multilora"]
     for key in ("history", "test", "per_subject", "num_subjects", "n_lora_layers"):
-        assert key in block, f"missing key {key} in non-global results"
+        assert key in block, f"missing key {key} in subject-specific results"
     assert "global_rank" not in block
     assert block["num_subjects"] == NUM_SUBJECTS
     assert block["n_lora_layers"] == N_LORA_LAYERS
@@ -378,7 +374,7 @@ def test_results_block_structure(make_model, model_name):
     assert len(block["history"]) == args.epochs
 
     results = {}
-    stages.run_joint_multilora_global(make_model(), None, args, torch.device("cpu"),
+    stages.run_stacked(make_model(), None, args, torch.device("cpu"),
                                       results=results)
     block = results["stages"]["multilora_global"]
     assert block["global_rank"] == args.gl_rank
@@ -387,7 +383,7 @@ def test_results_block_structure(make_model, model_name):
 def test_subject_id_context_cleared_after_run(make_model, model_name):
     _patch_loaders()
     multilora.set_subject_ids(torch.tensor([42]))   # poison
-    stages.run_joint_multilora(make_model(), None, _default_args(model=model_name),
+    stages.run_subject_specific(make_model(), None, _default_args(model=model_name),
                                torch.device("cpu"), results={})
     assert multilora._CTX.subject_ids is None, \
         "_SubjectCtx not cleared at end of training run"
@@ -411,7 +407,7 @@ def test_best_state_round_trip_matches_recorded_best(make_model, model_name):
 
     stages.eval_model_multilora = _spy
     try:
-        stages.run_joint_multilora(model, None, args, torch.device("cpu"),
+        stages.run_subject_specific(model, None, args, torch.device("cpu"),
                                    results={})
     finally:
         stages.eval_model_multilora = real_eval
@@ -433,7 +429,7 @@ def test_training_drives_loss_down_on_overfittable_task(make_model, model_name):
     _patch_loaders()
     args = _default_args(model=model_name, epochs=20, lr=5e-3, patience=0)
     results = {}
-    stages.run_joint_multilora(make_model(), None, args, torch.device("cpu"),
+    stages.run_subject_specific(make_model(), None, args, torch.device("cpu"),
                                results=results)
     history = results["stages"]["multilora"]["history"]
     final_train = history[-1]["train_acc"]
@@ -449,8 +445,8 @@ TESTS = [
     test_lora_bank_size_matches_num_subjects,
     test_backbone_frozen_head_and_lora_move,
     test_only_present_subjects_receive_lora_updates,
-    test_global_mode_trains_global_adapter,
-    test_non_global_mode_has_no_global_adapter,
+    test_stacked_trains_global_adapter,
+    test_non_stacked_has_no_global_adapter,
     test_results_block_structure,
     test_subject_id_context_cleared_after_run,
     test_best_state_round_trip_matches_recorded_best,

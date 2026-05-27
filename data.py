@@ -102,6 +102,12 @@ def _load_pp(model_name):
     }
 
 
+def load_lora_targets(model_name):
+    """Per-model LoRA target-module suffixes from models/<model_name>.yaml."""
+    with open(os.path.join(_MODELS_DIR, f"{model_name}.yaml")) as f:
+        return yaml.safe_load(f)["lora"]["target_modules"]
+
+
 def _standardize_per_channel(X, train_indices):
     """Per-channel z-score. Stats fit on the train split only to avoid leakage."""
     train_X = X[np.asarray(train_indices)]

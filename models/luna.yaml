@@ -11,3 +11,12 @@ data:
     scale_factor: null          # raw uV in, per-trial channel-wise z-score in the model
     clamp: null
     patch_size: 40              # LUNA temporal patch (samples), used for trial-length trim
+lora:
+  # Per-block attention (qkv_proj / proj) and FFN (fc1 / fc2). Names are scoped
+  # (attn.* / mlp.*) so PEFT's suffix matching does not pull in the
+  # cross-attention ffn or the freq-embed / channel-position Mlps.
+  target_modules:
+    - attn.qkv_proj
+    - attn.proj
+    - mlp.fc1
+    - mlp.fc2

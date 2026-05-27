@@ -1,6 +1,6 @@
-"""End-to-end correctness tests for the `joint` mode (run_joint_lora).
+"""End-to-end correctness tests for the `global` mode (run_global).
 
-The `joint` mode in stages.py is supposed to train the classification head
+The `global` mode in stages.py is supposed to train the classification head
 (final_layer) and a Global LoRA adapter jointly in a single training loop,
 with NO separate linear-probing phase. The head is made trainable via the
 PEFT LoraConfig's `modules_to_save=["final_layer"]`, so a single optimizer
@@ -8,7 +8,7 @@ at args.lr updates both the LoRA adapters and the head together, seeded from
 a fresh (random-init head) checkpoint instead of an LP checkpoint.
 
 This file wires a tiny REVE-shaped fake backbone and synthetic loaders into
-the real `run_joint_lora` orchestration in stages.py, then verifies:
+the real `run_global` orchestration in stages.py, then verifies:
   - no `lp` stage block is emitted (no separate linear-probing happened),
   - a `gl` stage block IS emitted with history / test / per_subject keys
     (1-based subject ids),
@@ -25,7 +25,7 @@ the real `run_joint_lora` orchestration in stages.py, then verifies:
   - a tiny overfittable subject-correlated task drives train acc above chance.
 
 Runs fully offline (no model / dataset download).
-Run:  conda run -n venv python tests/test_joint_mode.py
+Run:  conda run -n venv python tests/test_global_mode.py
 """
 import copy
 import os
@@ -193,10 +193,6 @@ def _default_args(**overrides):
         lr=1e-3,
         lora_rank=4,
         gl_rank=4,
-        load_final_layer=None,
-        load_global_lora=None,
-        save_final_layer=None,
-        save_global_lora=None,
         bf16=False,
     )
     for k, v in overrides.items():
@@ -207,15 +203,15 @@ def _default_args(**overrides):
 # ----- Tests ---------------------------------------------------------------- #
 
 def test_no_lp_stage_emitted():
-    """The whole point of `joint` mode is that there is NO separate
+    """The whole point of `global` mode is that there is NO separate
     linear-probing phase. The results dict must not contain an "lp" block."""
     _patch_loaders()
     results = {}
-    stages.run_joint_lora(TinyReve(), pos_bank=None, args=_default_args(),
+    stages.run_global(TinyReve(), pos_bank=None, args=_default_args(),
                           device=torch.device("cpu"), results=results)
     assert "stages" in results
     assert "lp" not in results["stages"], \
-        f"`joint` mode must skip LP, but results['stages'] has: {list(results['stages'])}"
+        f"`global` mode must skip LP, but results['stages'] has: {list(results['stages'])}"
 
 
 def test_gl_stage_block_structure():
@@ -223,11 +219,11 @@ def test_gl_stage_block_structure():
     _patch_loaders()
     args = _default_args()
     results = {}
-    stages.run_joint_lora(TinyReve(), pos_bank=None, args=args,
+    stages.run_global(TinyReve(), pos_bank=None, args=args,
                           device=torch.device("cpu"), results=results)
     block = results["stages"]["gl"]
     for key in ("history", "test", "per_subject"):
-        assert key in block, f"missing key '{key}' in gl block (joint mode)"
+        assert key in block, f"missing key '{key}' in gl block (global mode)"
     assert len(block["history"]) == args.epochs, \
         f"expected {args.epochs} history entries, got {len(block['history'])}"
     for k in ("acc", "balanced_acc", "f1"):
@@ -239,7 +235,7 @@ def test_gl_stage_block_structure():
 def test_non_lora_backbone_layers_stay_frozen():
     """Layers NOT in _LORA_TARGETS["reve"] (i.e., everything that isn't
     to_qkv / to_out / net.1 / net.3 and isn't the head) must be frozen by
-    PEFT and therefore byte-for-byte identical before vs. after the joint
+    PEFT and therefore byte-for-byte identical before vs. after the global
     run. We use the LayerNorm at `net.0` as the canary."""
     _patch_loaders()
     args = _default_args()
@@ -252,7 +248,7 @@ def test_non_lora_backbone_layers_stay_frozen():
             frozen_before[n] = p.detach().clone()
     assert frozen_before, "fixture has no LayerNorm params to use as canary"
 
-    stages.run_joint_lora(model, pos_bank=None, args=args,
+    stages.run_global(model, pos_bank=None, args=args,
                           device=torch.device("cpu"), results={})
 
     # After PEFT wrapping + merge_and_unload, the LayerNorm modules are
@@ -263,28 +259,27 @@ def test_non_lora_backbone_layers_stay_frozen():
         assert n in frozen_after, f"param {n} disappeared after the run"
         delta = (frozen_after[n].detach() - ref).abs().max().item()
         assert delta == 0.0, \
-            f"non-LoRA backbone param {n} drifted by {delta} — joint mode " \
+            f"non-LoRA backbone param {n} drifted by {delta} — global mode " \
             f"must keep non-targeted params frozen"
 
 
-def test_head_moves_in_joint_mode():
-    """The head (final_layer) is the whole reason `joint` exists alongside
-    `global`: it is trainable via PEFT's `modules_to_save` and must update
-    inside the same training loop."""
+def test_head_moves_in_global_mode():
+    """The head (final_layer) is trainable via PEFT's `modules_to_save` and
+    must update inside the same training loop."""
     _patch_loaders()
     args = _default_args()
     model = TinyReve()
     head_before = {n: p.detach().clone()
                    for n, p in model.final_layer.named_parameters()}
 
-    stages.run_joint_lora(model, pos_bank=None, args=args,
+    stages.run_global(model, pos_bank=None, args=args,
                           device=torch.device("cpu"), results={})
 
     moved = any(
         (head_before[n] - p.detach()).abs().max().item() > 0
         for n, p in model.final_layer.named_parameters()
     )
-    assert moved, "shared head (final_layer) did not move in `joint` mode"
+    assert moved, "shared head (final_layer) did not move in `global` mode"
 
 
 def test_lora_targeted_layers_received_a_delta():
@@ -304,7 +299,7 @@ def test_lora_targeted_layers_received_a_delta():
             before[n] = p.detach().clone()
     assert before, "fixture exposes no LoRA-targetable Linear weights"
 
-    stages.run_joint_lora(model, pos_bank=None, args=args,
+    stages.run_global(model, pos_bank=None, args=args,
                           device=torch.device("cpu"), results={})
 
     after = dict(model.named_parameters())
@@ -343,7 +338,7 @@ def test_fresh_checkpoint_seed_is_pretrain_state():
 
     stages.stage_global_lora = _spy
     try:
-        stages.run_joint_lora(model, pos_bank=None, args=args,
+        stages.run_global(model, pos_bank=None, args=args,
                               device=torch.device("cpu"), results={})
     finally:
         stages.stage_global_lora = real_stage
@@ -352,15 +347,15 @@ def test_fresh_checkpoint_seed_is_pretrain_state():
     for n, ref in head_at_entry.items():
         key = f"final_layer.{n}"
         assert key in captured["checkpoint"], \
-            f"seed checkpoint is missing {key} (joint mode should pass the full fresh state)"
+            f"seed checkpoint is missing {key} (global mode should pass the full fresh state)"
         delta = (captured["checkpoint"][key] - ref).abs().max().item()
         assert delta == 0.0, \
             f"seed checkpoint head ({key}) differs from pre-train head by {delta} — " \
-            f"a separate LP phase must have run, which violates `joint` semantics"
+            f"a separate LP phase must have run, which violates `global` semantics"
 
 
 def test_single_optimizer_at_args_lr():
-    """`joint` mode trains head + LoRA in ONE optimizer at args.lr. We hook
+    """`global` mode trains head + LoRA in ONE optimizer at args.lr. We hook
     torch.optim.AdamW to record every optimizer constructed during the run,
     then assert exactly one optimizer was built, with one param-group, at
     args.lr."""
@@ -382,13 +377,13 @@ def test_single_optimizer_at_args_lr():
 
     torch.optim.AdamW = _SpyAdamW
     try:
-        stages.run_joint_lora(TinyReve(), pos_bank=None, args=args,
+        stages.run_global(TinyReve(), pos_bank=None, args=args,
                               device=torch.device("cpu"), results={})
     finally:
         torch.optim.AdamW = real_adamw
 
     assert len(seen) == 1, \
-        f"expected exactly one AdamW optimizer in `joint` mode, got {len(seen)}: {seen}"
+        f"expected exactly one AdamW optimizer in `global` mode, got {len(seen)}: {seen}"
     assert seen[0]["n_groups"] == 1, \
         f"expected single param-group, got {seen[0]['n_groups']}"
     assert abs(seen[0]["lr"] - args.lr) < 1e-12, \
@@ -418,7 +413,7 @@ def test_best_state_round_trip_matches_recorded_best():
     trainer.eval_model = _spy
     try:
         results = {}
-        stages.run_joint_lora(TinyReve(), pos_bank=None, args=args,
+        stages.run_global(TinyReve(), pos_bank=None, args=args,
                               device=torch.device("cpu"), results=results)
     finally:
         trainer.eval_model = real_eval_trainer
@@ -438,7 +433,7 @@ def test_training_drives_train_acc_above_chance():
     _patch_loaders()
     args = _default_args(epochs=8, lr=3e-3, patience=0)
     results = {}
-    stages.run_joint_lora(TinyReve(), pos_bank=None, args=args,
+    stages.run_global(TinyReve(), pos_bank=None, args=args,
                           device=torch.device("cpu"), results=results)
     history = results["stages"]["gl"]["history"]
     final_train = history[-1]["train_acc"]
@@ -453,7 +448,7 @@ def main():
         test_no_lp_stage_emitted,
         test_gl_stage_block_structure,
         test_non_lora_backbone_layers_stay_frozen,
-        test_head_moves_in_joint_mode,
+        test_head_moves_in_global_mode,
         test_lora_targeted_layers_received_a_delta,
         test_fresh_checkpoint_seed_is_pretrain_state,
         test_single_optimizer_at_args_lr,

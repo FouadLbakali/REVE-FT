@@ -1,4 +1,4 @@
-"""Sweep LaBraM x {joint, joint_multilora, joint_multilora_global} x {seed} on
+"""Sweep LaBraM x {global, subject-specific, stacked} x {seed} on
 bciciv2a + zuo2025, loading each dataset's raw tensors only once per process
 instead of once per run.
 
@@ -116,51 +116,56 @@ _stages.load_loaders_per_subject = _cached_load_loaders_per_subject
 import main as _main  # noqa: E402
 
 
-SEEDS = (42, 67, 1331)
+SEEDS = (67, 1331, 42)
 MODES = (
-    ("linear",                 "lp"),
-    ("joint",                  "global"),
-    ("joint_multilora",        "multi"),
-    ("joint_multilora_global", "stacked"),
+    ("linear",           "lp"),
+    ("global",           "global"),
+    ("subject-specific", "multi"),
+    ("stacked",          "stacked"),
 )
 DATASETS = ("physionet",)
-MODEL = "luna"
-RESULTS_DIR = f"results/new_{MODEL}"
+MODELS = ("labram", "luna")
 NUM_SUBJECTS = 109
 
-
-def _build_combos():
+def _build_combos(model):
+    results_dir = f"results/new_{model}"
     combos = []
     for dataset in DATASETS:
         for seed in SEEDS:
             for mode, tag in MODES:
-                out = os.path.join(RESULTS_DIR, f"{dataset}_{tag}_s{seed}.json")
+                out = os.path.join(results_dir, f"{dataset}_{tag}_s{seed}.json")
                 combos.append((dataset, seed, mode, out))
     return combos
 
 
 def main():
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    combos = _build_combos()
-    for i, (dataset, seed, mode, results_out) in enumerate(combos, 1):
-        print("\n" + "#" * 72)
-        print(f"# [{i}/{len(combos)}] dataset={dataset} seed={seed} mode={mode}")
-        print(f"# -> {results_out}")
-        print("#" * 72, flush=True)
-        sys.argv = [
-            "main.py",
-            "--model", MODEL,
-            "--bf16",
-            "--seed", str(seed),
-            "--mode", mode,
-            "--dataset", dataset,
-            "--num-subjects", str(NUM_SUBJECTS),
-            "--results-out", results_out,
-        ]
-        _main.main()
+    for model in MODELS:
+        os.makedirs(f"results/new_{model}", exist_ok=True)
+        combos = _build_combos(model)
+        for i, (dataset, seed, mode, results_out) in enumerate(combos, 1):
+            print("\n" + "#" * 72)
+            print(f"# [{model} {i}/{len(combos)}] dataset={dataset} seed={seed} mode={mode}")
+            print(f"# -> {results_out}")
+            print("#" * 72, flush=True)
+            sys.argv = [
+                "main.py",
+                "--model", model,
+                "--bf16",
+                "--seed", str(seed),
+                "--mode", mode,
+                "--dataset", dataset,
+                "--num-subjects", str(NUM_SUBJECTS),
+                "--results-out", results_out,
+                # "--epochs", "1"
+            ]
+            _main.main()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        # This model's cached raw data is no longer needed; free it before the
+        # next model so two physionet copies don't sit in RAM at once.
+        _raw_cache.clear()
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

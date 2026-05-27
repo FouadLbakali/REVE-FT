@@ -8,3 +8,10 @@ data:
     scaler: StandardScaler
     scale_factor: null
     clamp: 15
+lora:
+  # Attention (q/k/v + output proj) + the two FFN linears of every block.
+  target_modules:
+    - to_qkv
+    - to_out
+    - net.1
+    - net.3

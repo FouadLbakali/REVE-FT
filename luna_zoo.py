@@ -21,13 +21,7 @@ import torch.nn as nn
 
 from luna_module.luna import LUNA, ClassificationHeadWithQueries
 
-# Per-block attention (qkv_proj / proj) and FFN (fc1 / fc2) inside every
-# RotaryTransformerBlock. The names are scoped (`attn.*` / `mlp.*`) so PEFT's
-# suffix matching does not pull in the cross-attention's ffn or the
-# freq-embed / channel-position Mlps that also happen to have `fc1`/`fc2`
-# submodules -- this mirrors LaBraM's `mlp.0`/`mlp.2` scoping.
 LUNA_REPO = "PulpBio/LUNA"
-LUNA_LORA_TARGET_MODULES = ["attn.qkv_proj", "attn.proj", "mlp.fc1", "mlp.fc2"]
 
 # Pretraining variant configs (config/model/LUNA_{base,large,huge}.yaml).
 LUNA_VARIANTS = {
@@ -106,22 +100,17 @@ class LunaWrapper(nn.Module):
 
     The classification head lives in `self.final_layer` (the engine swaps it
     with Identity for LP feature caching, yielding the pooled latent of shape
-    (B, num_patches, embed_dim*num_queries)). Two heads are available:
-
-    - 'flatten' (default): flatten that latent, then RMSNorm + Dropout +
-      Linear, matching REVE / LaBraM's `--pooling flatten`.
-    - 'luna': the official LUNA head (`ClassificationHeadWithQueries`,
-      learned-query attention pooling + MLP)."""
+    (B, num_patches, embed_dim*num_queries)). The head flattens that latent,
+    then RMSNorm + Dropout + Linear, matching REVE / LaBraM's flatten head."""
 
     def __init__(self, ch_names, n_times, n_classes, variant="large",
-                 pooling="flatten", dropout=0.1):
+                 dropout=0.1):
         super().__init__()
         if variant not in LUNA_VARIANTS:
             raise ValueError(f"Unknown LUNA variant {variant!r}, expected "
                               f"one of {list(LUNA_VARIANTS)}")
         cfg = dict(LUNA_VARIANTS[variant])
         self.variant = variant
-        self.pooling = pooling
         self.patch_size = cfg["patch_size"]
 
         self.backbone = LUNA(num_classes=n_classes, **cfg)
@@ -130,28 +119,20 @@ class LunaWrapper(nn.Module):
         # The engine swaps `final_layer` with Identity for LP feature caching;
         # the backbone's own `self.classifier` is set to Identity so the LUNA
         # forward returns the pooled latent untouched, which the head consumes.
-        head = self.backbone.classifier
-        assert isinstance(head, ClassificationHeadWithQueries)
+        assert isinstance(self.backbone.classifier, ClassificationHeadWithQueries)
         self.backbone.classifier = nn.Identity()
 
-        if pooling == "luna":
-            self.final_layer = head
-        elif pooling == "flatten":
-            # Flatten head matching REVE's `--pooling flatten`: flatten the
-            # (B, num_patches, embed_dim*num_queries) latent, then RMSNorm +
-            # Dropout + Linear. The official `head` above is left unreferenced
-            # (freed) so the flatten head trains from scratch.
-            num_patches = n_times // self.patch_size
-            dim = num_patches * self.backbone.embed_dim * self.backbone.num_queries
-            self.final_layer = nn.Sequential(
-                nn.Flatten(),
-                nn.RMSNorm(dim),
-                nn.Dropout(dropout),
-                nn.Linear(dim, n_classes),
-            )
-        else:
-            raise ValueError(f"Unknown pooling {pooling!r} for LUNA, "
-                             "expected 'flatten' or 'luna'")
+        # Flatten head: flatten the (B, num_patches, embed_dim*num_queries)
+        # latent, then RMSNorm + Dropout + Linear. The backbone's official
+        # head is dropped above so this head trains from scratch.
+        num_patches = n_times // self.patch_size
+        dim = num_patches * self.backbone.embed_dim * self.backbone.num_queries
+        self.final_layer = nn.Sequential(
+            nn.Flatten(),
+            nn.RMSNorm(dim),
+            nn.Dropout(dropout),
+            nn.Linear(dim, n_classes),
+        )
         self.normalize = _ChannelWiseNormalize()
 
         # Pre-computed 3-D electrode positions for this dataset (constant, so
@@ -177,11 +158,10 @@ class LunaSpec:
     known once the data loaders exist, so `build_model` returns this and the
     linear-probing runner materialises the model."""
 
-    def __init__(self, n_classes, variant="large", pooling="flatten"):
+    def __init__(self, n_classes, variant="large"):
         self.n_classes = n_classes
         self.variant = variant
-        self.pooling = pooling
 
     def build(self, ch_names, n_times):
         return LunaWrapper(ch_names, n_times, self.n_classes,
-                           variant=self.variant, pooling=self.pooling)
+                           variant=self.variant)
