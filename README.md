@@ -18,8 +18,7 @@ With plain pip instead: `pip install -e .`.
 
 - Pretrained backbones are downloaded from the Hugging Face Hub on first use
   (`brain-bzh/reve-base`, `braindecode/labram-pretrained`, `PulpBio/LUNA`).
-- EEG datasets are downloaded automatically via [MOABB](https://moabb.neurotechx.com/)
-  into `mne_data/`.
+- EEG datasets are downloaded automatically via [MOABB](https://moabb.neurotechx.com/).
 
 ## Usage
 
