@@ -1,9 +1,8 @@
 # REVE-FT
 
-Parameter-efficient fine-tuning of EEG foundation models (**REVE**, **LaBraM**, **LUNA**)
-for motor-imagery and related BCI classification tasks.
+Subject-adaptive parameter-efficient fine-tuning of EEG foundation models (**REVE**, **LaBraM**, **LUNA**) using **Stacked LoRA** for motor-imagery decoding.
 
-Code accompanying the paper *"<TODO: paper title>"* (<TODO: authors, venue, year>).
+Code accompanying the paper *"Stacked LoRA for Subject-Adaptive EEG Foundation Models in Motor Imagery Decoding"* (Aymen Sarhane, Fouad Lbakali, Mouad Souissi, Jonathan Lys, and Giulia Lioi, 2026).
 
 ## Installation
 
@@ -55,21 +54,6 @@ tests/                # offline correctness tests (no downloads required)
 
 ## Scripts
 
-- `scripts/run_sweep.py` — multi-seed × mode sweep that loads each dataset's raw
-  tensors once per process (LaBraM/LUNA-specific; see the module docstring for
-  the reproducibility caveat).
+- `scripts/run_all.py` — the script used to obtain all the results from the paper.
 - `scripts/plot_subjects_bciciv2a.py` — per-subject result figures for BCIC IV-2a.
-
-## Tests
-
-```bash
-uv run pytest
-```
-
-The tests run fully offline (no model or dataset downloads): they exercise the
-multi-LoRA routing math, per-sample gradient isolation, and seed reproducibility.
-
-## License
-
-TODO — a license must be added before publication. Without one, the code is
-"all rights reserved" by default.
+- `scripts/umap_class_x_strategy.py`

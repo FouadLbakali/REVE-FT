@@ -123,9 +123,8 @@ MODES = (
     ("subject-specific", "multi"),
     ("stacked",          "stacked"),
 )
-DATASETS = ("physionet",)
-MODELS = ("labram", "luna")
-NUM_SUBJECTS = 109
+DATASETS = ("bciciv2a","physionet","zuo2025")
+MODELS = ("reve","labram","luna")
 
 def _build_combos(model):
     results_dir = f"results/new_{model}"
@@ -140,7 +139,7 @@ def _build_combos(model):
 
 def main():
     for model in MODELS:
-        os.makedirs(f"results/new_{model}", exist_ok=True)
+        os.makedirs(f"results/{model}", exist_ok=True)
         combos = _build_combos(model)
         for i, (dataset, seed, mode, results_out) in enumerate(combos, 1):
             print("\n" + "#" * 72)
@@ -154,9 +153,7 @@ def main():
                 "--seed", str(seed),
                 "--mode", mode,
                 "--dataset", dataset,
-                "--num-subjects", str(NUM_SUBJECTS),
                 "--results-out", results_out,
-                # "--epochs", "1"
             ]
             _main.main()
             gc.collect()
