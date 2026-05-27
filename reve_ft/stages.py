@@ -4,8 +4,8 @@ import os
 import torch
 from peft import LoraConfig, get_peft_model
 
-from data import load_loaders, load_loaders_per_subject, load_lora_targets
-from engine import (
+from .data import load_loaders, load_loaders_per_subject, load_lora_targets
+from .engine import (
     eval_model_per_subject,
     eval_model_multilora,
     eval_model_multilora_per_subject,
@@ -15,10 +15,10 @@ from engine import (
     eval_head,
     eval_head_per_subject,
 )
-from labram_zoo import LabramSpec
-from luna_zoo import LunaSpec
-from multilora import inject_multi_subject_lora, merge_subject_lora
-from trainer import train_loop, print_metrics, make_scheduler, EarlyStopper
+from .labram_zoo import LabramSpec
+from .luna_zoo import LunaSpec
+from .multilora import inject_multi_subject_lora, merge_subject_lora
+from .trainer import train_loop, print_metrics, make_scheduler, EarlyStopper
 
 
 def _floatify(d):

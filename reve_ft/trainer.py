@@ -1,7 +1,7 @@
 import copy
 import math
 import torch
-from engine import train_one_epoch, eval_model
+from .engine import train_one_epoch, eval_model
 
 def make_scheduler(optimizer, epochs, steps_per_epoch, max_lr=1.0e-4):
     return torch.optim.lr_scheduler.OneCycleLR(

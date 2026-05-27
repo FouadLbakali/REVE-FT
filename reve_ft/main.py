@@ -16,17 +16,17 @@ import torch
 import yaml
 from transformers import AutoModel, set_seed
 
-from labram_zoo import LabramSpec
-from luna_zoo import LunaSpec
-from engine import set_bf16
-from stages import (
+from .labram_zoo import LabramSpec
+from .luna_zoo import LunaSpec
+from .engine import set_bf16
+from .stages import (
     run_global,
     run_subject_specific,
     run_stacked,
     run_linear_probing_cached,
 )
 
-_DATASETS_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datasets.yaml")
+_DATASETS_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "datasets.yaml")
 with open(_DATASETS_YAML) as f:
     _DATASETS = yaml.safe_load(f)
 

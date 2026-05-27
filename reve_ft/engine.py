@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from multilora import set_subject_ids
+from .multilora import set_subject_ids
 from sklearn.metrics import balanced_accuracy_score, cohen_kappa_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.preprocessing import label_binarize
 

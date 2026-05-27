@@ -15,7 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import data
+from reve_ft import data
 
 N_SUBJECTS = 4
 TRIALS_PER_SUBJECT = 24

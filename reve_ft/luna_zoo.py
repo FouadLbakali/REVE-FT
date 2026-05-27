@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from luna_module.luna import LUNA, ClassificationHeadWithQueries
+from .luna_module.luna import LUNA, ClassificationHeadWithQueries
 
 LUNA_REPO = "PulpBio/LUNA"
 

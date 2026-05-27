@@ -3,7 +3,7 @@ import socket
 import time
 from functools import partial
 
-_MNE_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mne_data")
+_MNE_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "mne_data")
 os.makedirs(_MNE_DATA, exist_ok=True)
 os.environ.setdefault("MNE_DATA", _MNE_DATA)
 os.environ.setdefault("MNE_DATASETS_EEGBCI_PATH", _MNE_DATA)
@@ -17,9 +17,9 @@ import torch
 import yaml
 from torch.utils.data import Dataset, random_split
 
-BCI_CHANNELS = ["Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
-                 "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
-                 "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz", "P2", "POz"]
+_DATASETS_YAML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "datasets.yaml")
+with open(_DATASETS_YAML) as f:
+    BCI_CHANNELS = yaml.safe_load(f)["bciciv2a"]["channels"]
 
 class BCIDataset(Dataset):
     def __init__(self, X, y, subject_ids):
@@ -64,7 +64,7 @@ def _per_subject_from_pooled(full_dataset, splits, subjects_raw,
     return subject_loaders
 
 
-_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "models")
 
 
 def _load_pp(model_name):

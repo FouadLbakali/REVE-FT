@@ -33,9 +33,9 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import multilora
-import stages
-from multilora import MultiSubjectLoraLinear
+from reve_ft import multilora
+from reve_ft import stages
+from reve_ft.multilora import MultiSubjectLoraLinear
 
 
 # ----- Test fixtures -------------------------------------------------------- #

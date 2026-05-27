@@ -37,8 +37,8 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import stages
-import trainer
+from reve_ft import stages
+from reve_ft import trainer
 
 
 # ----- Test fixtures -------------------------------------------------------- #

@@ -1,22 +1,75 @@
-# Fine-tuning de REVE
+# REVE-FT
+
+Parameter-efficient fine-tuning of EEG foundation models (**REVE**, **LaBraM**, **LUNA**)
+for motor-imagery and related BCI classification tasks.
+
+Code accompanying the paper *"<TODO: paper title>"* (<TODO: authors, venue, year>).
 
 ## Installation
 
-```bash
-pip install -r requirements.txt
-```
-
-## Structure
-
-```
-train.py          # Entraînement
-data.py           # Chargement des données
-engine.py         # Boucle d'entraînement / évaluation
-reve-repro-main/  # Code de REVE
-```
-
-## Utilisation
+Requires Python ≥ 3.10 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-python train.py --epochs 1 --mode "linear"
+uv sync
 ```
+
+This creates a virtual environment, installs the dependencies (exact versions
+pinned in `uv.lock`), and installs the `reve_ft` package in editable mode.
+With plain pip instead: `pip install -e .`.
+
+- Pretrained backbones are downloaded from the Hugging Face Hub on first use
+  (`brain-bzh/reve-base`, `braindecode/labram-pretrained`, `PulpBio/LUNA`).
+- EEG datasets are downloaded automatically via [MOABB](https://moabb.neurotechx.com/)
+  into `mne_data/`.
+
+## Usage
+
+```bash
+uv run reve-ft --model reve --mode linear --dataset bciciv2a --epochs 25 --seed 42
+```
+
+Key options (`uv run reve-ft --help` for the full list):
+
+- `--model` — `reve` | `labram` | `luna`
+- `--mode` — `linear` (linear probing) | `global` (single shared LoRA) |
+  `subject-specific` (per-subject LoRA) | `stacked`
+- `--dataset` — `bciciv2a` | `physionet` | `zuo2025`
+
+## Project structure
+
+```
+reve_ft/              # library + CLI (installable package)
+  main.py             # CLI entry point (the `reve-ft` command)
+  data.py             # dataset loading & preprocessing (MOABB)
+  engine.py           # train / eval primitives
+  trainer.py          # training loop, scheduler, early stopping
+  stages.py           # fine-tuning stages (linear / global / per-subject / stacked)
+  multilora.py        # per-subject multi-LoRA routing
+  labram_zoo.py       # LaBraM backbone wrapper
+  luna_zoo.py         # LUNA backbone wrapper
+  luna_module/        # LUNA model implementation
+  configs/            # model preprocessing/LoRA configs + dataset shapes (package data)
+scripts/              # experiment sweeps & plotting helpers
+tests/                # offline correctness tests (no downloads required)
+```
+
+## Scripts
+
+- `scripts/run_sweep.py` — multi-seed × mode sweep that loads each dataset's raw
+  tensors once per process (LaBraM/LUNA-specific; see the module docstring for
+  the reproducibility caveat).
+- `scripts/plot_subjects_bciciv2a.py` — per-subject result figures for BCIC IV-2a.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+The tests run fully offline (no model or dataset downloads): they exercise the
+multi-LoRA routing math, per-sample gradient isolation, and seed reproducibility.
+
+## License
+
+TODO — a license must be added before publication. Without one, the code is
+"all rights reserved" by default.

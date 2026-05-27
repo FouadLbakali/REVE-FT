@@ -1,0 +1,40 @@
+[project]
+name = "reve-ft"
+version = "0.1.0"
+description = "Fine-tuning EEG foundation models (REVE, LaBraM, LUNA) for motor-imagery and related BCI tasks."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Fouad" }]
+dependencies = [
+    "torch",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "pandas",
+    "matplotlib",
+    "pyyaml",
+    "einops",
+    "timm",
+    "rotary-embedding-torch",
+    "transformers",
+    "peft",
+    "tqdm",
+    "moabb",
+    "umap-learn",
+]
+
+[project.scripts]
+reve-ft = "reve_ft.main:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["reve_ft"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -13,7 +13,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from multilora import (
+from reve_ft.multilora import (
     MultiSubjectLoraLinear,
     inject_multi_subject_lora,
     set_subject_ids,

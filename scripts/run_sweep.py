@@ -22,7 +22,7 @@ from functools import partial
 import numpy as np
 import torch
 
-import data as _data
+from reve_ft import data as _data
 
 _raw_cache = {}
 
@@ -110,10 +110,10 @@ def _cached_load_loaders_per_subject(dataset, pos_bank, batch_size, seed=None,
 
 
 _data.load_loaders_per_subject = _cached_load_loaders_per_subject
-import stages as _stages  # noqa: E402
+from reve_ft import stages as _stages  # noqa: E402
 _stages.load_loaders_per_subject = _cached_load_loaders_per_subject
 
-import main as _main  # noqa: E402
+from reve_ft import main as _main  # noqa: E402
 
 
 SEEDS = (67, 1331, 42)
