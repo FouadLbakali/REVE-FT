@@ -27,9 +27,9 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 
-from reve_ft.data import load_loaders_per_subject
-from reve_ft.engine import extract_features
-from reve_ft.main import build_model
+from stacked_lora.data import load_loaders_per_subject
+from stacked_lora.engine import extract_features
+from stacked_lora.main import build_model
 
 SEED = 42
 BATCH_SIZE = 64

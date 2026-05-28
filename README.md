@@ -1,4 +1,4 @@
-# REVE-FT
+# Stacked LoRA
 
 Subject-adaptive parameter-efficient fine-tuning of EEG foundation models (**REVE**, **LaBraM**, **LUNA**) using **Stacked LoRA** for motor-imagery decoding.
 
@@ -13,20 +13,20 @@ uv sync
 ```
 
 This creates a virtual environment, installs the dependencies (exact versions
-pinned in `uv.lock`), and installs the `reve_ft` package in editable mode.
+pinned in `uv.lock`), and installs the `stacked_lora` package in editable mode.
 With plain pip instead: `pip install -e .`.
 
-- Pretrained backbones are downloaded from the Hugging Face Hub on first use
+- Pretrained backbones are downloaded from the Hugging Face Hub
   (`brain-bzh/reve-base`, `braindecode/labram-pretrained`, `PulpBio/LUNA`).
-- EEG datasets are downloaded automatically via [MOABB](https://moabb.neurotechx.com/).
+- EEG datasets are downloaded via [MOABB](https://moabb.neurotechx.com/).
 
 ## Usage
 
 ```bash
-uv run reve-ft --model reve --mode linear --dataset bciciv2a --epochs 25 --seed 42
+uv run stacked-lora --model reve --mode linear --dataset bciciv2a --epochs 25 --seed 42
 ```
 
-Key options (`uv run reve-ft --help` for the full list):
+Key options (`uv run stacked-lora --help` for the full list):
 
 - `--model` — `reve` | `labram` | `luna`
 - `--mode` — `linear` (linear probing) | `global` (single shared LoRA) |
@@ -36,8 +36,8 @@ Key options (`uv run reve-ft --help` for the full list):
 ## Project structure
 
 ```
-reve_ft/              # library + CLI (installable package)
-  main.py             # CLI entry point (the `reve-ft` command)
+stacked_lora/         # library + CLI (installable package)
+  main.py             # CLI entry point (the `stacked-lora` command)
   data.py             # dataset loading & preprocessing (MOABB)
   engine.py           # train / eval primitives
   trainer.py          # training loop, scheduler, early stopping
@@ -48,14 +48,10 @@ reve_ft/              # library + CLI (installable package)
   luna_module/        # LUNA model implementation
   configs/            # model preprocessing/LoRA configs + dataset shapes (package data)
 scripts/              # experiment sweeps & plotting helpers
-tests/                # offline correctness tests (no downloads required)
 ```
 
 ## Scripts
 
 - `scripts/run_all.py` — the script used to obtain all the results from the paper.
 - `scripts/plot_subjects_bciciv2a.py` — per-subject result figures for BCIC IV-2a.
-- `scripts/ablation_lora_rank.py` — LoRA-rank ablation for REVE on BCIC IV-2a:
-  per-step training-loss curves, one line per rank, for `--gl-rank` (global mode)
-  and `--lora-rank` (subject-specific mode). Trains + plots a 2-panel figure.
-- `scripts/umap_class_x_strategy.py`
+- `scripts/umap_class_x_strategy.py` — UMAP of REVE embeddings on BCIC IV-2a (3 strategies × 4 classes).
